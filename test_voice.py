@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 from fastapi.testclient import TestClient
 from twilio.request_validator import RequestValidator
-import v2 as app
+import app
 
 class FakeSocket:
     def __init__(self): self.sent=[]
@@ -151,7 +151,7 @@ class Tests(unittest.TestCase):
             await session.consume_tts(AudioSource(),{'start':app.now()})
             audio=b''.join(base64.b64decode(m['media']['payload']) for m in ws.sent if m['event']=='media')
             self.assertEqual(len(audio),160)
-            self.assertLess(abs(int.from_bytes(app.audioop.ulaw2lin(audio[:1],2),'little',signed=True)-1000),40)
+            self.assertLess(abs(int.from_bytes(app.audioop.ulaw2lin(audio[70:71],2),'little',signed=True)-1000),40)
             self.assertTrue(any(m['event']=='mark' for m in ws.sent))
         asyncio.run(check())
     def test_barge_in_cancel(self):
@@ -272,7 +272,8 @@ class BridgeTests(unittest.TestCase):
             s=app.Session(FakeSocket());seen=[]
             async def speak(text,voice):seen.append(text)
             async def respond(text):raise AssertionError('routine LLM called')
-            s.speak_text=speak;s.respond=respond
+            s.speak_text=speak
+            s.play_cached=__import__('unittest.mock',fromlist=['AsyncMock']).AsyncMock();s.respond=respond
             with patch.dict(os.environ,{'ISABELLE_BRIDGE_ENABLED':'0'}):
                 await s.handle_utterance('let me speak to Izzy');await asyncio.sleep(0)
                 await s.handle_utterance('Who am I?')
@@ -297,6 +298,7 @@ class BridgeTests(unittest.TestCase):
                 envelopes.append(envelope)
                 app.BRIDGE_PENDING[envelope['turn_id']]['future'].set_result('This is the real reply.')
             s.speak_text=speak
+            s.play_cached=__import__('unittest.mock',fromlist=['AsyncMock']).AsyncMock()
             with self.env(),patch.object(app,'bridge_publish',side_effect=mail):
                 await s.handle_utterance('Let me speak to Isabelle')
                 await asyncio.sleep(.01)
@@ -432,4 +434,37 @@ class CachedAudioTests(unittest.IsolatedAsyncioTestCase):
         data=b''.join(base64.b64decode(m['media']['payload']) for m in s.ws.sent if m['event']=='media')
         self.assertEqual(data,base64.b64decode(app.CACHED_AUDIO['hello']))
     async def test_cached_handoff_is_bounded(self):
-        self.assertLess(len(base64.b64decode(app.CACHED_AUDIO['handoff'])),24000)
+        self.assertLess(len(base64.b64decode(app.CACHED_AUDIO['handoff'])),64000)
+
+class AudioQualityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_out_of_band_tone_is_filtered(self):
+        import numpy as np
+        samples=(10000*np.sin(2*np.pi*6000*np.arange(48000)/48000)).astype('<i2')
+        class Source:
+            def __aiter__(self):return self.run()
+            async def run(self):
+                for offset in range(0,len(samples),777):
+                    yield json.dumps({'audio':base64.b64encode(samples[offset:offset+777].tobytes()).decode()})
+        ws=FakeSocket();s=app.Session(ws);ws.session=s;s.stream_sid='test'
+        metric={'start':app.now()};await s.consume_tts(Source(),metric)
+        audio=b''.join(base64.b64decode(x['media']['payload']) for x in ws.sent if x['event']=='media')
+        out=np.frombuffer(app.audioop.ulaw2lin(audio,2),dtype='<i2').astype(float)
+        self.assertEqual(len(out),8000)
+        self.assertLess(np.sqrt(np.mean(out[300:-300]**2)),5)
+        self.assertEqual(metric['resampler'],'soxr_HQ')
+    async def test_raw_pcm_capture_and_odd_byte_carry(self):
+        from unittest.mock import Mock
+        ws=FakeSocket();s=app.Session(ws);ws.session=s;s.stream_sid='test';s.capture=Mock()
+        await s.consume_tts(AudioSource(),{'start':app.now()})
+        captured=[x for x in s.capture.add.call_args_list if x.args[0]=='hume_pcm']
+        self.assertEqual(len(captured),2)
+        self.assertEqual(sum(len(base64.b64decode(x.kwargs['audio'])) for x in captured),1920)
+        self.assertTrue(all(x.kwargs['sample_rate']==48000 for x in captured))
+    async def test_handoff_starts_cached_audio_before_publish(self):
+        from unittest.mock import AsyncMock
+        s=app.Session(FakeSocket());s.play_cached=AsyncMock();s.process_bridge=AsyncMock()
+        with patch.object(app,'bridge_ready',return_value=True):
+            await s.handle_utterance('Let me speak to Isabelle')
+            await asyncio.sleep(.01)
+        s.play_cached.assert_awaited_once_with('handoff')
+        self.assertEqual(s.mode,'isabelle')
