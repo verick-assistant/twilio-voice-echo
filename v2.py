@@ -74,7 +74,7 @@ class TTSBudget:
 
 log = logging.getLogger('voice')
 app = FastAPI()
-VERSION = '2.3.2'
+VERSION = '2.4.0'
 BASE = os.getenv('BASE_URL', '').rstrip('/')
 KEYS = ('DEEPGRAM_API_KEY', 'OPENROUTER_API_KEY', 'HUME_API_KEY')
 # Model IDs are configurable and must be validated against OpenRouter before live use.
@@ -380,6 +380,11 @@ class Session:
         self.closed = False
         self.audio_queue = asyncio.Queue(maxsize=250) # five seconds of inbound 20ms audio
         self.pending_marks = set()
+        self.mark_sent = {}
+        self.coalesce_task = None
+        self.barge_task = None
+        self.speech_started = None
+        self.last_speech_at = now()
         self.metrics = deque(maxlen=30)
 
     def spawn(self, coro):
@@ -392,6 +397,7 @@ class Session:
         await self.ws.send_json(data)
 
     async def clear(self):
+        log.warning("voice_playback_cancel session=%s turn=%d playing=%s pending_marks=%d", self.session_id, self.turn_index, self.playing, len(self.pending_marks))
         if self.turn and not self.turn.done():
             self.turn.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -399,6 +405,7 @@ class Session:
         if self.playing:
             await self.send({'event': 'clear', 'streamSid': self.stream_sid})
         self.pending_marks.clear()
+        self.mark_sent.clear()
         self.playing = False
 
     async def route(self, text):
@@ -427,11 +434,29 @@ class Session:
             # Explicit degraded routing, not an assertion that Jev ran.
             return 'capable', round((now()-start)*1000), 'fallback'
 
+    async def confirmed_barge_in(self):
+        await asyncio.sleep(max(.15, float(os.getenv('BARGE_CONFIRM_MS', '250')) / 1000))
+        if self.speech_started is not None and now() - self.last_speech_at < .8:
+            await self.clear()
+
+    async def flush_fragments(self, delay):
+        await asyncio.sleep(delay)
+        if not self.final_parts or now() - self.last_speech_at < delay * .9:
+            return
+        text = ' '.join(self.final_parts)
+        self.final_parts.clear()
+        await self.clear()
+        self.turn_index += 1
+        log.warning('voice_stt_turn session=%s turn=%d characters=%d', self.session_id, self.turn_index, len(text))
+        await self.handle_utterance(text)
+
     async def listen(self):
         async for raw in self.dg:
             msg = json.loads(raw)
             if msg.get('type') == 'SpeechStarted':
-                await self.clear()
+                self.speech_started = now()
+                if self.coalesce_task and not self.coalesce_task.done():
+                    self.coalesce_task.cancel()
                 continue
             if msg.get('type') == 'Error':
                 raise RuntimeError('stt_provider_error')
@@ -439,18 +464,28 @@ class Session:
                 continue
             alternatives = msg.get('channel', {}).get('alternatives', [])
             text = alternatives[0].get('transcript', '').strip() if alternatives else ''
+            if text:
+                if self.speech_started is None:
+                    self.speech_started = now()
+                self.last_speech_at = now()
+                if self.coalesce_task and not self.coalesce_task.done():
+                    self.coalesce_task.cancel()
+                if self.playing and (self.barge_task is None or self.barge_task.done()):
+                    self.barge_task = self.spawn(self.confirmed_barge_in())
             if text and not msg.get('is_final') and self.mode == 'routine':
                 if self.route_task is None or self.route_task.done():
                     self.route_text = text
                     self.route_task = self.spawn(self.route(text))
             if msg.get('is_final') and text:
                 self.final_parts.append(text)
-            if msg.get('speech_final') and self.final_parts:
-                utterance = ' '.join(self.final_parts)
-                self.final_parts.clear()
-                await self.clear()
-                self.turn_index += 1
-                await self.handle_utterance(utterance)
+                log.warning('voice_stt_fragment session=%s characters=%d speech_final=%s', self.session_id, len(text), bool(msg.get('speech_final')))
+            if self.final_parts and (msg.get('is_final') or msg.get('speech_final')):
+                delay = max(.3, float(os.getenv('FRAGMENT_HOLD_MS', '700')) / 1000)
+                joined = ' '.join(self.final_parts).rstrip(' .!?').lower()
+                if joined.endswith(('you can', 'make note of', 'for', 'to', 'of', 'and', 'a', 'the', 'my')):
+                    delay = max(delay, 1.5)
+                self.coalesce_task = self.spawn(self.flush_fragments(delay))
+                self.speech_started = None
 
     async def request_brief(self):
         if not bridge_ready():
@@ -517,7 +552,9 @@ class Session:
             try:
                 stream_id = await bridge_publish(envelope)
                 BRIDGE_PENDING[turn_id]['stream_id'] = stream_id
+                bridge_start = now()
                 answer = await asyncio.wait_for(future, timeout=300)
+                log.warning('voice_bridge_reply session=%s turn=%s wait_ms=%d', self.session_id, turn_id, round((now()-bridge_start)*1000))
                 self.bridge_context.append({'speaker': 'caller', 'text': text})
                 self.bridge_context.append({'speaker': 'isabelle', 'text': answer})
                 # New caller speech can cancel audio, but not this mailbox handoff.
@@ -543,7 +580,7 @@ class Session:
         # Bridge replies are spoken verbatim. No additional LLM completion.
         if not voice_id or not self.budget.configured():
             return
-        metric = {'turn': self.turn_index, 'mode': self.mode, 'start': now()}
+        metric = {'session': self.session_id, 'turn': self.turn_index, 'mode': self.mode, 'start': now(), 'voice_id': voice_id}
         query = urlencode({'api_key': os.environ['HUME_API_KEY'], 'format_type': 'pcm',
             'strip_headers': 'true', 'no_binary': 'true', 'instant_mode': 'true', 'version': '2'})
         try:
@@ -553,14 +590,22 @@ class Session:
                     await self.send_tts(tts, {'text': text, 'voice': {'id': voice_id, 'provider': os.getenv('ISABELLE_HUME_VOICE_PROVIDER', 'CUSTOM_VOICE') if voice_id == os.getenv('ISABELLE_HUME_VOICE_ID') else 'HUME_AI'}, 'flush': True}, metric)
                     await tts.send(json.dumps({'close': True}))
                     await asyncio.wait_for(consumer, 30)
+                    metric['completed'] = True
+                    metric['pending_marks_at_completion'] = len(self.pending_marks)
                 finally:
                     if not consumer.done():
                         consumer.cancel()
                         await asyncio.gather(consumer, return_exceptions=True)
         except asyncio.CancelledError:
+            metric['interrupted'] = True
             raise
         except Exception as exc:
+            metric['error_type'] = type(exc).__name__
             log.warning('bridge_audio_stopped %s', type(exc).__name__)
+        finally:
+            metric['total_ms'] = round((now()-metric.pop('start'))*1000)
+            self.metrics.append(metric)
+            log.warning('voice_bridge_audio %s', json.dumps(metric))
 
 
     async def upload_audio(self):
@@ -692,7 +737,14 @@ class Session:
             encoded = msg.get('audio')
             if not encoded:
                 continue
-            pcm = remainder + base64.b64decode(encoded, validate=True)
+            decoded = base64.b64decode(encoded, validate=True)
+            if decoded.startswith((b'RIFF', b'ID3', b'OggS')):
+                raise ValueError('unexpected_encoded_audio_format')
+            metric['pcm_bytes'] = metric.get('pcm_bytes', 0) + len(decoded)
+            metric['source_format'] = 'pcm_s16le_mono'
+            metric['source_sample_rate'] = int(os.getenv('HUME_SAMPLE_RATE', '48000'))
+            metric['target_format'] = 'mulaw_8000_mono'
+            pcm = remainder + decoded
             remainder = pcm[len(pcm) - len(pcm)%2:] if len(pcm)%2 else b''
             pcm = pcm[:len(pcm)-len(pcm)%2]
             if not pcm:
@@ -700,10 +752,12 @@ class Session:
             # Hume PCM is signed 16-bit mono at 48kHz per its official player.
             # Stateful conversion avoids discontinuities between streamed chunks.
             down, converter = audioop.ratecv(pcm, 2, 1, int(os.getenv('HUME_SAMPLE_RATE', '48000')), 8000, converter)
+            metric['pcm_peak'] = max(metric.get('pcm_peak', 0), audioop.max(pcm, 2))
             queued.extend(audioop.lin2ulaw(down, 2))
             frames = 0
             while len(queued) >= 160:
                 audio = bytes(queued[:160]); del queued[:160]
+                metric['mulaw_bytes_sent'] = metric.get('mulaw_bytes_sent', 0) + len(audio)
                 frames += 1
                 if 'first_audio_ms' not in metric:
                     metric['first_audio_ms'] = round((now()-metric['start'])*1000)
@@ -713,6 +767,7 @@ class Session:
                 if frames % 10 == 0:
                     mark = secrets.token_hex(4)
                     self.pending_marks.add(mark)
+                    self.mark_sent[mark] = now()
                     await self.send({'event': 'mark', 'streamSid': self.stream_sid, 'mark': {'name': mark}})
                     deadline = now() + 10
                     while len(self.pending_marks) >= 2:
@@ -722,6 +777,7 @@ class Session:
             # Backpressure: keep Twilio's queued playback below a short window.
             mark = secrets.token_hex(4)
             self.pending_marks.add(mark)
+            self.mark_sent[mark] = now()
             await self.send({'event': 'mark', 'streamSid': self.stream_sid, 'mark': {'name': mark}})
             deadline = now() + 10
             while len(self.pending_marks) >= 2:
@@ -734,6 +790,7 @@ class Session:
                              'media': {'payload': base64.b64encode(queued).decode()}})
             mark = secrets.token_hex(4)
             self.pending_marks.add(mark)
+            self.mark_sent[mark] = now()
             await self.send({'event': 'mark', 'streamSid': self.stream_sid, 'mark': {'name': mark}})
 
     async def enforce_session_limit(self, seconds):
@@ -769,7 +826,7 @@ class Session:
                 self.brief_task = self.spawn(self.request_brief())
                 query = urlencode({'model': 'nova-3', 'encoding': 'mulaw', 'sample_rate': 8000,
                                    'channels': 1, 'interim_results': 'true', 'vad_events': 'true',
-                                   'endpointing': os.getenv('ENDPOINTING_MS', '100'), 'smart_format': 'true'})
+                                   'endpointing': os.getenv('ENDPOINTING_MS', '500'), 'smart_format': 'true'})
                 async with websockets.connect('wss://api.deepgram.com/v1/listen?' + query,
                      additional_headers={'Authorization': 'Token ' + os.environ['DEEPGRAM_API_KEY']}, open_timeout=8) as self.dg:
                     reader = self.spawn(self.listen())
@@ -791,7 +848,11 @@ class Session:
                                 raise ValueError('oversized_media')
                             self.audio_queue.put_nowait(payload)
                         elif msg.get('event') == 'mark':
-                            self.pending_marks.discard(msg.get('mark', {}).get('name'))
+                            mark_name = msg.get('mark', {}).get('name')
+                            self.pending_marks.discard(mark_name)
+                            sent = self.mark_sent.pop(mark_name, None)
+                            if sent is not None:
+                                log.warning('voice_playback_ack session=%s mark=%s latency_ms=%d', self.session_id, mark_name, round((now()-sent)*1000))
                             if not self.pending_marks:
                                 self.playing = False
             except (WebSocketDisconnect, asyncio.CancelledError):
