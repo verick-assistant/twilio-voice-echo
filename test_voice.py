@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 from fastapi.testclient import TestClient
 from twilio.request_validator import RequestValidator
-import app
+import v2 as app
 
 class FakeSocket:
     def __init__(self): self.sent=[]
