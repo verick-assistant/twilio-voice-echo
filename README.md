@@ -95,3 +95,8 @@ Bridge-off returns 503 before auth, so 503 alone does not verify key recognition
 
 ### Bounded first inbound call (v2.3.1)
 Non-diagnostic streams close after CALL_MAX_SECONDS (default and maximum 1200). TwiML explicitly hangs up after the Connect stream ends. Disabling flags alone only blocks new sessions; it does not stop an already established call. Operator shutdown still follows call completion or the separately scheduled window deadline. Acoustic escalation remains untested until a real call.
+
+### Voice reliability tuning (v2.4.0)
+Default endpointing500ms, final-fragment hold700ms, likely unfinished phrases hold1500ms. New speech cancels the pending fragment timer; final fragments coalesce rather than each immediately creating a bridge turn. Barge-in requires nonempty recognized speech plus a250ms confirmation instead of canceling on every bare VAD SpeechStarted. These are conservative tunings, not measured optimal settings. Playback cancel, mark-ack latency, source/target formats, byte counts, PCM peaks and bridge TTS completion/interruption/errors are logged without transcript/private audio content. Source remains assumed signed16-bit mono48kHz; encoded RIFF/ID3/Ogg payloads fail closed rather than being treated as PCM.
+
+Offline PSTN-format check reuses the bounded male synthetic clip (no new synthesis or phone call): adversarial odd-sized PCM chunks produce exactly the same8kHz mu-law bytes as whole-buffer conversion. Decoded capture is intelligible; this does not diagnose the reported real-phone static or certify provider-returned live PCM format. Calls remain off. Next approved phone test must correlate sent bytes, mark acknowledgments and caller listening, not merely callback200.
