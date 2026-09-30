@@ -72,9 +72,9 @@ class TTSBudget:
 
 log = logging.getLogger('voice')
 app = FastAPI()
-VERSION = '2.2.2'
+VERSION = '2.2.3'
 BASE = os.getenv('BASE_URL', '').rstrip('/')
-KEYS = ('DEEPGRAM_API_KEY', 'OPENROUTER_API_KEY', 'HUME_API_KEY', 'TYPESAFE_API_KEY')
+KEYS = ('DEEPGRAM_API_KEY', 'OPENROUTER_API_KEY', 'HUME_API_KEY')
 # Model IDs are configurable and must be validated against OpenRouter before live use.
 MODELS = {'fast': os.getenv('MODEL_FAST', 'openai/gpt-4.1-mini'),
           'capable': os.getenv('MODEL_CAPABLE', 'anthropic/claude-sonnet-4')}
@@ -367,14 +367,14 @@ class Session:
     async def route(self, text):
         # Start on interim text; never block STT/audio transport on routing.
         start = now()
-        if not os.getenv('TYPESAFE_API_KEY'):
-            return 'capable', 0, 'fallback_no_jev_key'
+        if not os.getenv('OPENROUTER_API_KEY'):
+            return 'capable', 0, 'fallback_no_openrouter_key'
         criteria = {'fast': 'Short conversation, simple facts, or clarification. Minimize latency and cost.',
                     'capable': 'Complex reasoning, technical planning, sensitive or ambiguous requests. Prioritize capability.'}
         try:
-            r = await self.client.post('https://api.typesafe.ai/v1/systemone',
-                headers={'Authorization': 'Bearer ' + os.environ['TYPESAFE_API_KEY']},
-                json={'model': 'jev-latest', 'state': {'utterance': text},
+            r = await self.client.post('https://openrouter.ai/api/alpha/decisions',
+                headers={'Authorization': 'Bearer ' + os.environ['OPENROUTER_API_KEY']},
+                json={'model': os.getenv('JEV_MODEL', 'typesafe/jev-1.13'), 'state': {'utterance': text},
                       'questions': {'route': {'type': 'choice', 'instructions': 'Choose the response model class.', 'criteria': criteria}}},
                 timeout=1.5)
             r.raise_for_status()
@@ -383,7 +383,7 @@ class Session:
             confidence = float(answer.get('confidence', 0))
             if choice not in MODELS or confidence < .75:
                 choice = 'capable'
-            return choice, round((now()-start)*1000), 'jev'
+            return choice, round((now()-start)*1000), 'jev_openrouter'
         except asyncio.CancelledError:
             raise
         except Exception:
