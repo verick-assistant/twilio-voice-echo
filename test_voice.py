@@ -423,3 +423,13 @@ class RecordingTests(unittest.IsolatedAsyncioTestCase):
         from unittest.mock import AsyncMock
         s=app.Session(FakeSocket());s.dg=STT();s.handle_utterance=AsyncMock();await s.listen();await asyncio.sleep(.8)
         s.handle_utterance.assert_awaited_once_with('calendar Friday')
+
+class CachedAudioTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cached_hello_starts_without_generation(self):
+        from unittest.mock import AsyncMock
+        s=app.Session(FakeSocket());s.budget.reserve=AsyncMock();await s.play_cached('hello')
+        self.assertEqual(s.ws.sent[0]['event'],'media');s.budget.reserve.assert_not_called()
+        data=b''.join(base64.b64decode(m['media']['payload']) for m in s.ws.sent if m['event']=='media')
+        self.assertEqual(data,base64.b64decode(app.CACHED_AUDIO['hello']))
+    async def test_cached_handoff_is_bounded(self):
+        self.assertLess(len(base64.b64decode(app.CACHED_AUDIO['handoff'])),24000)
