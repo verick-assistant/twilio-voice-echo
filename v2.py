@@ -93,11 +93,104 @@ def wants_isabelle(text):
         return False
     return bool(re.search(r"\b(?:let me|can i|could i|i want to|i would like to|please)?\s*(?:speak|talk) (?:directly )?(?:to|with) (?:the real )?(?:isabelle|isabel|izzy|issy)\b", words))
 
+BRIDGE_STREAM = 'voice:bridge:v1:utterances'
+BRIDGE_GROUP = 'isabelle-relay-v1'
+BRIDGE_HEARTBEAT = 'voice:bridge:v1:relay-live'
+
 def bridge_ready():
     return (os.getenv('ISABELLE_BRIDGE_ENABLED') == '1'
-        and all(os.getenv(k) for k in ('ISABELLE_HUME_VOICE_ID', 'BRIDGE_RESEND_API_KEY',
-            'BRIDGE_MAIL_FROM', 'BRIDGE_REPLY_SECRET'))
+        and all(os.getenv(k) for k in ('ISABELLE_HUME_VOICE_ID', 'USAGE_REDIS_URL', 'BRIDGE_REPLY_SECRET'))
         and os.getenv('ISABELLE_HUME_VOICE_ID') != os.getenv('HUME_VOICE_ID'))
+
+def bridge_mail_ready():
+    return all(os.getenv(k) for k in ('BRIDGE_RESEND_API_KEY', 'BRIDGE_MAIL_FROM'))
+
+def bridge_client():
+    return redis.from_url(os.environ['USAGE_REDIS_URL'], decode_responses=True, socket_timeout=25, socket_connect_timeout=3)
+
+async def bridge_publish(envelope):
+    client = bridge_client()
+    try:
+        # Payload expiry bounds call-context retention even if no relay ever starts.
+        ident = await client.xadd(BRIDGE_STREAM, {'payload': json.dumps(envelope)}, maxlen=100, approximate=False)
+        await client.expire(BRIDGE_STREAM, 600)
+        live = await client.exists(BRIDGE_HEARTBEAT)
+        if not live and bridge_mail_ready():
+            # Same turn ID deduplicates an email/Redis race on the receiver's side.
+            with contextlib.suppress(Exception):
+                await send_bridge_mail(envelope)
+        return ident
+    finally:
+        await client.aclose()
+
+async def bridge_ack(ident):
+    client = bridge_client()
+    try:
+        await client.xack(BRIDGE_STREAM, BRIDGE_GROUP, ident)
+        await client.xdel(BRIDGE_STREAM, ident)
+    except redis.ResponseError:
+        # No group yet when fallback mail answered before relay started.
+        await client.xdel(BRIDGE_STREAM, ident)
+    finally:
+        await client.aclose()
+
+async def bridge_auth(request):
+    if not bridge_ready():
+        return None, 503
+    body = await request.body()
+    if len(body) > 20000:
+        return None, 413
+    stamp = request.headers.get('x-bridge-timestamp', '')
+    supplied = request.headers.get('x-bridge-signature', '')
+    try:
+        if abs(time.time()-int(stamp)) > 120:
+            return None, 401
+    except ValueError:
+        return None, 401
+    expected = hmac.new(os.environ['BRIDGE_REPLY_SECRET'].encode(), stamp.encode()+b'.'+body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, supplied):
+        return None, 401
+    return body, None
+
+@app.post('/isabelle/relay/next')
+async def isabelle_next(request: Request):
+    body, error = await bridge_auth(request)
+    if error:
+        return Response(status_code=error)
+    try:
+        relay = json.loads(body)['relay_id']
+        if not isinstance(relay, str) or not re.fullmatch(r'[a-zA-Z0-9_-]{1,64}', relay):
+            return Response(status_code=422)
+    except (ValueError, KeyError, TypeError):
+        return Response(status_code=422)
+    client = bridge_client()
+    try:
+        await client.set(BRIDGE_HEARTBEAT, relay, ex=45)
+        try:
+            await client.xgroup_create(BRIDGE_STREAM, BRIDGE_GROUP, '0', mkstream=True)
+        except redis.ResponseError as exc:
+            if 'BUSYGROUP' not in str(exc):
+                raise
+        # Reclaim a crashed relay's message after 60 seconds. Receiver must dedup turn_id.
+        reclaimed = await client.xautoclaim(BRIDGE_STREAM, BRIDGE_GROUP, relay, 60000, '0-0', count=1)
+        entries = reclaimed[1]
+        if not entries:
+            streams = await client.xreadgroup(BRIDGE_GROUP, relay, {BRIDGE_STREAM: '>'}, count=1, block=20000)
+            entries = streams[0][1] if streams else []
+        await client.expire(BRIDGE_STREAM, 600)
+        if not entries:
+            return Response(status_code=204)
+        ident, fields = entries[0]
+        payload = json.loads(fields['payload'])
+        if payload['expires_at'] <= time.time() or payload['turn_id'] not in BRIDGE_PENDING:
+            await client.xack(BRIDGE_STREAM, BRIDGE_GROUP, ident)
+            await client.xdel(BRIDGE_STREAM, ident)
+            return Response(status_code=204)
+        return JSONResponse(payload)
+    except Exception:
+        return Response(status_code=503)
+    finally:
+        await client.aclose()
 
 async def send_bridge_mail(envelope):
     # Fixed audience. API key and sender require separate setup and owner permission.
@@ -114,21 +207,9 @@ async def send_bridge_mail(envelope):
 
 @app.post('/isabelle/reply')
 async def isabelle_reply(request: Request):
-    if not bridge_ready():
-        return Response(status_code=503)
-    body = await request.body()
-    if len(body) > 20000:
-        return Response(status_code=413)
-    stamp = request.headers.get('x-bridge-timestamp', '')
-    supplied = request.headers.get('x-bridge-signature', '')
-    try:
-        if abs(time.time()-int(stamp)) > 120:
-            return Response(status_code=401)
-    except ValueError:
-        return Response(status_code=401)
-    expected = hmac.new(os.environ['BRIDGE_REPLY_SECRET'].encode(), stamp.encode()+b'.'+body, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(expected, supplied):
-        return Response(status_code=401)
+    body, error = await bridge_auth(request)
+    if error:
+        return Response(status_code=error)
     try:
         value = json.loads(body)
         turn = value['turn_id']; session = value['session_id']; text = value['text']
@@ -334,7 +415,7 @@ class Session:
             sequence, text = await self.bridge_queue.get()
             turn_id = secrets.token_urlsafe(20)
             future = asyncio.get_running_loop().create_future()
-            BRIDGE_PENDING[turn_id] = {'session_id': self.session_id, 'future': future}
+            BRIDGE_PENDING[turn_id] = {'session_id': self.session_id, 'future': future, 'stream_id': None}
             envelope = {'version': 1, 'session_id': self.session_id, 'turn_id': turn_id,
                 'sequence': sequence, 'call_sid': self.call_sid, 'mode': 'isabelle',
                 'caller_identity': 'unverified',
@@ -343,7 +424,8 @@ class Session:
                 'reply_url': BASE + '/isabelle/reply',
                 'expires_at': int(time.time()) + 300}
             try:
-                await send_bridge_mail(envelope)
+                stream_id = await bridge_publish(envelope)
+                BRIDGE_PENDING[turn_id]['stream_id'] = stream_id
                 answer = await asyncio.wait_for(future, timeout=300)
                 self.bridge_context.append({'speaker': 'caller', 'text': text})
                 self.bridge_context.append({'speaker': 'isabelle', 'text': answer})
@@ -360,7 +442,10 @@ class Session:
                 with contextlib.suppress(asyncio.CancelledError):
                     await self.turn
             finally:
-                BRIDGE_PENDING.pop(turn_id, None)
+                item = BRIDGE_PENDING.pop(turn_id, None)
+                if item and item.get('stream_id'):
+                    with contextlib.suppress(Exception):
+                        await bridge_ack(item['stream_id'])
                 self.bridge_queue.task_done()
 
     async def speak_text(self, text, voice_id):
@@ -374,7 +459,7 @@ class Session:
             async with websockets.connect('wss://api.hume.ai/v0/tts/stream/input?' + query, open_timeout=8) as tts:
                 consumer = self.spawn(self.consume_tts(tts, metric))
                 try:
-                    await self.send_tts(tts, {'text': text, 'voice': {'id': voice_id, 'provider': 'HUME_AI'}, 'flush': True}, metric)
+                    await self.send_tts(tts, {'text': text, 'voice': {'id': voice_id, 'provider': os.getenv('ISABELLE_HUME_VOICE_PROVIDER', 'CUSTOM_VOICE') if voice_id == os.getenv('ISABELLE_HUME_VOICE_ID') else 'HUME_AI'}, 'flush': True}, metric)
                     await tts.send(json.dumps({'close': True}))
                     await asyncio.wait_for(consumer, 30)
                 finally:
