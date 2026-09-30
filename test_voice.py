@@ -56,10 +56,38 @@ class Tests(unittest.TestCase):
             self.assertIn('<Hangup',r.text)
     def test_router_without_key(self):
         async def check():
-            with patch.dict(os.environ, {'TYPESAFE_API_KEY':''}):
+            with patch.dict(os.environ, {'OPENROUTER_API_KEY':''}):
                 s=app.Session(FakeSocket())
                 result=await s.route('Hello')
-                self.assertEqual(result,('capable',0,'fallback_no_jev_key'))
+                self.assertEqual(result,('capable',0,'fallback_no_openrouter_key'))
+        asyncio.run(check())
+    def test_jev_openrouter_contract_and_fallbacks(self):
+        import httpx
+        async def check():
+            for choice, confidence, expected in [('fast', .9, 'fast'), ('fast', .5, 'capable'), ('unknown', .95, 'capable')]:
+                def handler(request):
+                    self.assertEqual(str(request.url), 'https://openrouter.ai/api/alpha/decisions')
+                    self.assertEqual(request.headers['Authorization'], 'Bearer unit-router')
+                    body = json.loads(request.content)
+                    self.assertEqual(body['model'], 'typesafe/jev-1.13')
+                    self.assertEqual(body['state'], {'utterance': 'Hello'})
+                    self.assertEqual(set(body['questions']['route']['criteria']), {'fast', 'capable'})
+                    return httpx.Response(200, json={'answers': {'route': {'choice': choice, 'confidence': confidence}}})
+                with patch.dict(os.environ, {'OPENROUTER_API_KEY':'unit-router', 'JEV_MODEL':'typesafe/jev-1.13'}):
+                    session = app.Session(FakeSocket())
+                    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                        session.client = client
+                        result = await session.route('Hello')
+                    self.assertEqual(result[0], expected)
+                    self.assertEqual(result[2], 'jev_openrouter')
+            for response in [httpx.Response(503), httpx.Response(200, json={'answers':{}})]:
+                with patch.dict(os.environ, {'OPENROUTER_API_KEY':'unit-router'}):
+                    session = app.Session(FakeSocket())
+                    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: response)) as client:
+                        session.client = client
+                        result = await session.route('Hello')
+                    self.assertEqual(result[0], 'capable')
+                    self.assertEqual(result[2], 'fallback')
         asyncio.run(check())
     def test_diagnostic_socket_disabled(self):
         from starlette.websockets import WebSocketDisconnect
