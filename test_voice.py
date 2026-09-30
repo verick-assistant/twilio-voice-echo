@@ -495,3 +495,29 @@ class CallFeedbackTests(unittest.IsolatedAsyncioTestCase):
     def test_allowed_lines_exact_match(self):
         with patch.dict(os.environ,{'TEST_FROM_NUMBERS':'+17865271894,+15555555555,bad'}):
             self.assertEqual(app.allowed_callers(),{'+17865271894','+15555555555'})
+
+
+class SpeechGuardTests(unittest.IsolatedAsyncioTestCase):
+    def test_complete_reply_has_terminal_punctuation_and_bound(self):
+        self.assertEqual(app.complete_speech_text(' Hi  there '), 'Hi there.')
+        self.assertEqual(app.complete_speech_text('Yes.'), 'Yes.')
+        text = app.complete_speech_text('First sentence. ' + 'extra ' * 100)
+        self.assertEqual(text, 'First sentence.')
+        self.assertLessEqual(len(app.complete_speech_text('word ' * 100)), 361)
+    async def test_overrun_drops_oversized_pcm_before_playback(self):
+        class Runaway:
+            def __aiter__(self): return self.run()
+            async def run(self):
+                yield json.dumps({'audio': base64.b64encode(bytes(48000 * 2 * 5)).decode()})
+        ws = FakeSocket(); session = app.Session(ws); ws.session = session
+        metric = {'start': app.now(), 'audio_limit_seconds': 4}
+        with self.assertRaisesRegex(RuntimeError, 'tts_audio_overrun'):
+            await session.consume_tts(Runaway(), metric)
+        self.assertTrue(metric['audio_overrun'])
+        self.assertFalse(any(x['event'] == 'media' for x in ws.sent))
+    def test_full_reply_single_submit(self):
+        import inspect
+        source = inspect.getsource(app.Session.respond)
+        self.assertEqual(source.count('await self.send_tts('), 1)
+        self.assertIn("'close': True", source)
+        self.assertNotIn("'flush': True", source)
