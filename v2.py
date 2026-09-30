@@ -189,16 +189,16 @@ async def verify_cached_assets_on_startup():
 
 
 class TTSBudget:
-    def __init__(self):
+    def __init__(self, connect=True):
         self.url = os.getenv('USAGE_REDIS_URL', '')
         self.limit = int(os.getenv('HUME_BUDGET_CHARACTERS', '0'))
         self.period_end = int(os.getenv('HUME_BUDGET_PERIOD_END', '0'))
         self.verified = os.getenv('HUME_BUDGET_VERIFIED') == '1'
         self.scope = os.getenv('HUME_BUDGET_SCOPE', '')
-        self.client = redis.from_url(self.url, socket_timeout=2, socket_connect_timeout=2) if self.url else None
+        self.client = shared_redis_client(self.url, False, 2) if self.url and connect else None
 
     def configured(self):
-        return bool(self.client and self.verified and self.scope and self.limit>0 and self.period_end>time.time())
+        return bool(self.url and self.verified and self.scope and self.limit>0 and self.period_end>time.time())
 
     async def reserve(self, text):
         if not self.configured():
@@ -224,7 +224,7 @@ class TTSBudget:
 log = logging.getLogger('voice')
 app = FastAPI()
 app.add_event_handler('startup', verify_cached_assets_on_startup)
-VERSION = '2.8.3'
+VERSION = '2.8.4'
 BASE = os.getenv('BASE_URL', '').rstrip('/')
 KEYS = ('DEEPGRAM_API_KEY', 'OPENROUTER_API_KEY', 'HUME_API_KEY')
 # Model IDs are configurable and must be validated against OpenRouter before live use.
@@ -272,8 +272,27 @@ def bridge_ready():
 def bridge_mail_ready():
     return all(os.getenv(k) for k in ('BRIDGE_RESEND_API_KEY', 'BRIDGE_MAIL_FROM'))
 
+REDIS_POOLS = {}
+
+def shared_redis_client(url, decode_responses=False, socket_timeout=5):
+    # Reuse bounded TLS connections; short-lived clients do not own the pool.
+    key = (url, decode_responses, socket_timeout)
+    pool = REDIS_POOLS.get(key)
+    if pool is None:
+        pool = redis.ConnectionPool.from_url(url, decode_responses=decode_responses,
+            socket_timeout=socket_timeout, socket_connect_timeout=3, max_connections=8)
+        REDIS_POOLS[key] = pool
+    return redis.Redis(connection_pool=pool)
+
+async def close_redis_pools():
+    pools = list(REDIS_POOLS.values())
+    REDIS_POOLS.clear()
+    await asyncio.gather(*(pool.aclose() for pool in pools), return_exceptions=True)
+
+app.add_event_handler('shutdown', close_redis_pools)
+
 def bridge_client():
-    return redis.from_url(os.environ['USAGE_REDIS_URL'], decode_responses=True, socket_timeout=25, socket_connect_timeout=3)
+    return shared_redis_client(os.environ['USAGE_REDIS_URL'], True, 25)
 
 async def bridge_publish(envelope):
     client = bridge_client()
@@ -471,11 +490,22 @@ def ready():
     return all(os.getenv(k) for k in KEYS if k != 'TYPESAFE_API_KEY') and bool(os.getenv('HUME_VOICE_ID') or os.getenv('HUME_VOICE_NAME'))
 
 
+def memory_rss_kb():
+    try:
+        with open('/proc/self/status') as status:
+            for line in status:
+                if line.startswith('VmRSS:'):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    return None
+
 @app.get('/health')
 async def health():
     return {'ok': True, 'version': VERSION, 'realtime_ready': ready(), 'realtime_enabled': os.getenv('REALTIME_ENABLED') == '1',
             'providers': {k.removesuffix('_API_KEY').lower(): bool(os.getenv(k)) for k in KEYS},
-            'tts_budget_configured': TTSBudget().configured(),
+            'tts_budget_configured': TTSBudget(connect=False).configured(),
+            'memory_rss_kb': memory_rss_kb(),
             'voice_configured': bool(os.getenv('HUME_VOICE_ID') or os.getenv('HUME_VOICE_NAME')),
             'twilio_env': bool(os.getenv('TWILIO_ACCOUNT_SID') and os.getenv('TWILIO_AUTH_TOKEN')),
             'cached_assets': CACHED_ASSET_STATUS['state'],
@@ -540,7 +570,7 @@ class CallCapture:
         if not secret or not os.getenv('USAGE_REDIS_URL'):
             raise RuntimeError('recording_storage_unconfigured')
         self.cipher = AESGCM(hashlib.sha256(('voice-recording-v1:'+secret).encode()).digest())
-        self.client = redis.from_url(os.environ['USAGE_REDIS_URL'], socket_timeout=5, socket_connect_timeout=3)
+        self.client = shared_redis_client(os.environ['USAGE_REDIS_URL'], False, 5)
         self.started = now()
         self.pending = []
         self.failed = False
