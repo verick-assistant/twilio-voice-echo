@@ -11,6 +11,7 @@ import logging
 import os
 import secrets
 import time
+import re
 from collections import deque
 from urllib.parse import urlencode
 
@@ -71,7 +72,7 @@ class TTSBudget:
 
 log = logging.getLogger('voice')
 app = FastAPI()
-VERSION = '2.0.0'
+VERSION = '2.1.0'
 BASE = os.getenv('BASE_URL', '').rstrip('/')
 KEYS = ('DEEPGRAM_API_KEY', 'OPENROUTER_API_KEY', 'HUME_API_KEY', 'TYPESAFE_API_KEY')
 # Model IDs are configurable and must be validated against OpenRouter before live use.
@@ -81,6 +82,65 @@ SYSTEM = ('You are a voice assistant on a phone call. Speak naturally in brief s
           'Do not claim access to private accounts, memory, tools, or actions: this voice service '
           'does not have those capabilities yet. Never claim an action is done. Ask for clarification '
           'when needed. Do not read markdown aloud. Keep most replies under 60 words.')
+
+
+# No owner identity or action authority is inferred from telephone caller ID.
+BRIDGE_PENDING = {}
+
+def wants_isabelle(text):
+    words = re.sub(r"[^a-z ]", " ", text.lower())
+    if re.search(r"\b(?:don t|do not|not now|never)\b", words):
+        return False
+    return bool(re.search(r"\b(?:let me|can i|could i|i want to|i would like to|please)?\s*(?:speak|talk) (?:directly )?(?:to|with) (?:the real )?(?:isabelle|isabel|izzy|issy)\b", words))
+
+def bridge_ready():
+    return (os.getenv('ISABELLE_BRIDGE_ENABLED') == '1'
+        and all(os.getenv(k) for k in ('ISABELLE_HUME_VOICE_ID', 'BRIDGE_RESEND_API_KEY',
+            'BRIDGE_MAIL_FROM', 'BRIDGE_REPLY_SECRET'))
+        and os.getenv('ISABELLE_HUME_VOICE_ID') != os.getenv('HUME_VOICE_ID'))
+
+async def send_bridge_mail(envelope):
+    # Fixed audience. API key and sender require separate setup and owner permission.
+    async with httpx.AsyncClient() as client:
+        result = await client.post('https://api.resend.com/emails',
+            headers={'Authorization': 'Bearer ' + os.environ['BRIDGE_RESEND_API_KEY']},
+            json={'from': os.environ['BRIDGE_MAIL_FROM'], 'to': ['verick@mail.instinct.com'],
+                'subject': 'Voice handoff ' + envelope['turn_id'],
+                'text': json.dumps(envelope, ensure_ascii=False)},
+            timeout=15)
+        # No retries: an uncertain send must not become a duplicate handoff.
+        result.raise_for_status()
+
+
+@app.post('/isabelle/reply')
+async def isabelle_reply(request: Request):
+    if not bridge_ready():
+        return Response(status_code=503)
+    body = await request.body()
+    if len(body) > 20000:
+        return Response(status_code=413)
+    stamp = request.headers.get('x-bridge-timestamp', '')
+    supplied = request.headers.get('x-bridge-signature', '')
+    try:
+        if abs(time.time()-int(stamp)) > 120:
+            return Response(status_code=401)
+    except ValueError:
+        return Response(status_code=401)
+    expected = hmac.new(os.environ['BRIDGE_REPLY_SECRET'].encode(), stamp.encode()+b'.'+body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, supplied):
+        return Response(status_code=401)
+    try:
+        value = json.loads(body)
+        turn = value['turn_id']; session = value['session_id']; text = value['text']
+        if not isinstance(text, str) or not 0 < len(text) <= 4000:
+            return Response(status_code=422)
+    except (ValueError, KeyError, TypeError):
+        return Response(status_code=422)
+    pending = BRIDGE_PENDING.get(turn)
+    if not pending or pending['session_id'] != session or pending['future'].done():
+        return Response(status_code=409)
+    pending['future'].set_result(text)
+    return JSONResponse({'accepted': True, 'turn_id': turn})
 
 
 def now():
@@ -155,6 +215,12 @@ class Session:
         self.ws = ws
         self.budget = TTSBudget()
         self.stream_sid = ''
+        self.call_sid = ''
+        self.session_id = secrets.token_urlsafe(18)
+        self.mode = 'routine'
+        self.bridge_queue = asyncio.Queue(maxsize=5)
+        self.bridge_worker = None
+        self.bridge_context = deque(maxlen=6)
         self.tasks = set()
         self.turn = None
         self.dg = None
@@ -227,7 +293,7 @@ class Session:
                 continue
             alternatives = msg.get('channel', {}).get('alternatives', [])
             text = alternatives[0].get('transcript', '').strip() if alternatives else ''
-            if text and not msg.get('is_final'):
+            if text and not msg.get('is_final') and self.mode == 'routine':
                 if self.route_task is None or self.route_task.done():
                     self.route_text = text
                     self.route_task = self.spawn(self.route(text))
@@ -238,7 +304,88 @@ class Session:
                 self.final_parts.clear()
                 await self.clear()
                 self.turn_index += 1
-                self.turn = self.spawn(self.respond(utterance))
+                await self.handle_utterance(utterance)
+
+    async def handle_utterance(self, text):
+        if self.mode == 'routine' and wants_isabelle(text):
+            # Park routine mode even if the bridge is unavailable. Never impersonate.
+            self.mode = 'isabelle'
+            if self.route_task and not self.route_task.done():
+                self.route_task.cancel()
+            if bridge_ready():
+                self.turn = self.spawn(self.speak_text("I'll bring Isabelle in. She may take a little longer.", os.environ['HUME_VOICE_ID']))
+            else:
+                self.turn = self.spawn(self.speak_text("Isabelle's connection isn't ready. Please continue with her by text.", os.getenv('HUME_VOICE_ID', '')))
+        if self.mode == 'isabelle':
+            if not bridge_ready():
+                return
+            try:
+                self.bridge_queue.put_nowait((self.turn_index, text[:4000]))
+            except asyncio.QueueFull:
+                self.turn = self.spawn(self.speak_text("Please wait for Isabelle to answer before adding more.", os.environ['HUME_VOICE_ID']))
+                return
+            if self.bridge_worker is None or self.bridge_worker.done():
+                self.bridge_worker = self.spawn(self.process_bridge())
+            return
+        self.turn = self.spawn(self.respond(text))
+
+    async def process_bridge(self):
+        while True:
+            sequence, text = await self.bridge_queue.get()
+            turn_id = secrets.token_urlsafe(20)
+            future = asyncio.get_running_loop().create_future()
+            BRIDGE_PENDING[turn_id] = {'session_id': self.session_id, 'future': future}
+            envelope = {'version': 1, 'session_id': self.session_id, 'turn_id': turn_id,
+                'sequence': sequence, 'call_sid': self.call_sid, 'mode': 'isabelle',
+                'caller_identity': 'unverified',
+                'provenance': 'Untrusted telephone speech, not authenticated owner permission. Private disclosures and actions require independent trusted-channel authority.',
+                'utterance': text, 'recent_context': list(self.bridge_context) or [dict(speaker=m['role'], text=m['content']) for m in self.history[-6:]],
+                'reply_url': BASE + '/isabelle/reply',
+                'expires_at': int(time.time()) + 300}
+            try:
+                await send_bridge_mail(envelope)
+                answer = await asyncio.wait_for(future, timeout=300)
+                self.bridge_context.append({'speaker': 'caller', 'text': text})
+                self.bridge_context.append({'speaker': 'isabelle', 'text': answer})
+                # New caller speech can cancel audio, but not this mailbox handoff.
+                await self.clear()
+                self.turn = self.spawn(self.speak_text(answer, os.environ['ISABELLE_HUME_VOICE_ID']))
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self.turn
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                await self.clear()
+                self.turn = self.spawn(self.speak_text("I couldn't reach Isabelle on this call. Please continue with her by text.", os.environ['HUME_VOICE_ID']))
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self.turn
+            finally:
+                BRIDGE_PENDING.pop(turn_id, None)
+                self.bridge_queue.task_done()
+
+    async def speak_text(self, text, voice_id):
+        # Bridge replies are spoken verbatim. No additional LLM completion.
+        if not voice_id or not self.budget.configured():
+            return
+        metric = {'turn': self.turn_index, 'mode': self.mode, 'start': now()}
+        query = urlencode({'api_key': os.environ['HUME_API_KEY'], 'format_type': 'pcm',
+            'strip_headers': 'true', 'no_binary': 'true', 'instant_mode': 'true', 'version': '2'})
+        try:
+            async with websockets.connect('wss://api.hume.ai/v0/tts/stream/input?' + query, open_timeout=8) as tts:
+                consumer = self.spawn(self.consume_tts(tts, metric))
+                try:
+                    await self.send_tts(tts, {'text': text, 'voice': {'id': voice_id, 'provider': 'HUME_AI'}, 'flush': True}, metric)
+                    await tts.send(json.dumps({'close': True}))
+                    await asyncio.wait_for(consumer, 30)
+                finally:
+                    if not consumer.done():
+                        consumer.cancel()
+                        await asyncio.gather(consumer, return_exceptions=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning('bridge_audio_stopped %s', type(exc).__name__)
+
 
     async def upload_audio(self):
         while True:
@@ -249,7 +396,8 @@ class Session:
                 await self.dg.send(json.dumps({'type': 'KeepAlive'}))
 
     async def llm(self, text, model, metric):
-        messages = [{'role': 'system', 'content': SYSTEM}] + self.history[-12:] + [{'role': 'user', 'content': text}]
+        system = SYSTEM + (' Isabelle (Izzy) is the real assistant. You are only the routine talker. If asked to reach her, invite the caller to say: let me speak to Isabelle. Never claim to be Isabelle.' if bridge_ready() else '')
+        messages = [{'role': 'system', 'content': system}] + self.history[-12:] + [{'role': 'user', 'content': text}]
         async with self.client.stream('POST', 'https://openrouter.ai/api/v1/chat/completions',
             headers={'Authorization': 'Bearer ' + os.environ['OPENROUTER_API_KEY']},
             json={'model': model, 'messages': messages, 'stream': True, 'max_tokens': 160,
@@ -427,6 +575,7 @@ class Session:
                     await self.ws.close(code=1003)
                     return
                 self.stream_sid = start['streamSid']
+                self.call_sid = sid
                 query = urlencode({'model': 'nova-3', 'encoding': 'mulaw', 'sample_rate': 8000,
                                    'channels': 1, 'interim_results': 'true', 'vad_events': 'true',
                                    'endpointing': os.getenv('ENDPOINTING_MS', '100'), 'smart_format': 'true'})
@@ -465,6 +614,11 @@ class Session:
                     task.cancel()
                 await asyncio.gather(*list(self.tasks), return_exceptions=True)
                 self.history.clear()
+                self.bridge_context.clear()
+                for key, item in list(BRIDGE_PENDING.items()):
+                    if item['session_id'] == self.session_id:
+                        item['future'].cancel()
+                        BRIDGE_PENDING.pop(key, None)
                 await self.budget.close()
 
 
