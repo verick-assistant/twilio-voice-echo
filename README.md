@@ -13,7 +13,7 @@ Required environment:
 - TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER
 - CALL_TOKEN, TEST_TO_NUMBER for the restricted outbound test-call endpoint
 - DEEPGRAM_API_KEY, OPENROUTER_API_KEY, HUME_API_KEY
-- TYPESAFE_API_KEY enables Jev; missing key uses an explicitly logged capable-model fallback
+- Jev uses OPENROUTER_API_KEY through POST https://openrouter.ai/api/alpha/decisions; no TypeSafe key/account needed. JEV_MODEL defaults to pinned typesafe/jev-1.13. Missing OpenRouter key uses an explicitly logged capable-model fallback.
 - HUME_VOICE_ID or HUME_VOICE_NAME (verify the selected British female voice)
 
 Execution is disabled by default. REALTIME_ENABLED=1 enables calls. DIAGNOSTICS_ENABLED=1 plus DIAGNOSTIC_TOKEN enables the private fixture WebSocket for short no-dial tests. Never enable either merely because keys are present.
@@ -82,3 +82,6 @@ Redis Streams namespace voice:bridge:v1 is separate from voice:tts accounting. P
 On accepted stream start the app publishes type=context_brief_request with session_id, turn_id, call_sid, expiry and no asserted caller identity. No private brief is inferred from caller ID. Relay answers signed POST /isabelle/brief, same HMAC contract, JSON {"session_id":"...","turn_id":"...","brief":"short advisory context","audience_verified":true,"disclosure_authorized":true,"source_reference":"reference to independent audience/scope evidence"}. Text is limited to 1,500 characters; source_reference 1-300 characters. Sender must actually check identity and disclosure permission; booleans do not create either. Unknown inbound callers get no personal brief. Do not include secrets or action/permission instructions. Missing attestations returns 403, invalid size 422, wrong/stale/replayed turn 409. Briefs expire after five minutes waiting, are used only on subsequent routine-model turns, and clear at hangup. They are injected as JSON advisory data, never a system instruction or authority. No extra generation or spoken message is triggered by a brief. Untyped older envelopes are utterances; new utterances carry type=utterance. Relay must dispatch by type to the supplied fixed callback and never treat a brief request as a caller's spoken task.
 
 Owner-name pronunciation: user specified "V-Air-ick, like Derrick but with a V." Both routine and Isabelle synthesis replace standalone Verick with Vairick at the TTS boundary, while original relay text and conversation history stay unchanged. The ledger reserves the actual respelled synthesis text. This is a pronunciation hint, not an acoustically verified result; next approved audio test should check it.
+
+### Jev on OpenRouter (v2.2.3)
+Typed fast/capable routing now shares the funded OpenRouter key, retaining the 1.5s deadline and 0.75 confidence threshold. This is not typesafe/jev-router (the separate automatic chat router). Mock contract tests pass; paid live decision/latency remains unverified. Calls, diagnostics and budget verification remain off. Sources: https://openrouter.ai/docs/guides/community/jev and https://openrouter.ai/docs/guides/community/jev-tutorial .
