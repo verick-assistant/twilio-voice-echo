@@ -4,15 +4,16 @@ FastAPI/ASGI service for Twilio bidirectional Media Streams. Streaming Deepgram 
 
 ## Deployment
 
-Build: `pip install -r requirements.txt`
-Start: `gunicorn app:app` (ASGI worker configured in gunicorn.conf.py).
+Build: `pip install -r 2-requirements.txt`
+Start: `gunicorn -c 3-gunicorn.conf.py v2:app` (ASGI worker configured in 3-gunicorn.conf.py).
 Python 3.10+; audioop-lts supplies audioop on Python 3.13+.
 
 Required environment:
 - BASE_URL (public HTTPS service origin)
 - TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER
 - CALL_TOKEN, TEST_TO_NUMBER for the restricted outbound test-call endpoint
-- DEEPGRAM_API_KEY, OPENROUTER_API_KEY, HUME_API_KEY, TYPESAFE_API_KEY
+- DEEPGRAM_API_KEY, OPENROUTER_API_KEY, HUME_API_KEY
+- TYPESAFE_API_KEY enables Jev; missing key uses an explicitly logged capable-model fallback
 - HUME_VOICE_ID or HUME_VOICE_NAME (verify the selected British female voice)
 
 Optional: STREAM_SECRET, MODEL_FAST, MODEL_CAPABLE, HUME_SAMPLE_RATE (48000), ENDPOINTING_MS (100).
