@@ -225,7 +225,7 @@ class Session:
         response_text = ''
         # Connect TTS while the route resolves, hiding connection setup behind routing.
         query = urlencode({'api_key': os.environ['HUME_API_KEY'], 'format_type': 'pcm',
-                           'strip_headers': 'true', 'no_binary': 'true', 'instant_mode': 'true'})
+                           'strip_headers': 'true', 'no_binary': 'true', 'instant_mode': 'true', 'version': '2'})
         tts_task = asyncio.create_task(websockets.connect('wss://api.hume.ai/v0/tts/stream/input?' + query,
                                                        open_timeout=8).__aenter__())
         tts = None
