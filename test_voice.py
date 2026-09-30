@@ -468,3 +468,30 @@ class AudioQualityTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(.01)
         s.play_cached.assert_awaited_once_with('handoff')
         self.assertEqual(s.mode,'isabelle')
+
+class CallFeedbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_greeting_delay_point_eight(self):
+        from unittest.mock import AsyncMock
+        s=app.Session(FakeSocket());s.play_cached=AsyncMock()
+        with patch.object(app.asyncio,'sleep',new_callable=AsyncMock) as sleeper:
+            await s.greet()
+        sleeper.assert_awaited_once_with(.8)
+        s.play_cached.assert_awaited_once_with('hello')
+    async def test_caller_line_metadata_is_not_authority(self):
+        from unittest.mock import AsyncMock
+        s=app.Session(FakeSocket());s.caller_number='+17865271894';s.caller_recognized=True
+        async def publish(e):
+            self.assertEqual(e['caller_number'],'+17865271894')
+            self.assertTrue(e['caller_line_recognized'])
+            self.assertEqual(e['caller_identity'],'unverified')
+            app.BRIDGE_PENDING[e['turn_id']]['future'].set_result('Test reply')
+            return 'mock'
+        s.speak_text=AsyncMock();s.clear=AsyncMock()
+        with patch.object(app,'bridge_publish',side_effect=publish),patch.object(app,'bridge_ack',new_callable=AsyncMock),patch.dict(os.environ,{'ISABELLE_HUME_VOICE_ID':'test'}):
+            await s.bridge_queue.put((1,'test'))
+            task=asyncio.create_task(s.process_bridge())
+            await asyncio.wait_for(s.bridge_queue.join(),1)
+            task.cancel();await asyncio.gather(task,return_exceptions=True)
+    def test_allowed_lines_exact_match(self):
+        with patch.dict(os.environ,{'TEST_FROM_NUMBERS':'+17865271894,+15555555555,bad'}):
+            self.assertEqual(app.allowed_callers(),{'+17865271894','+15555555555'})
