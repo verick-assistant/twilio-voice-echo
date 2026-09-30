@@ -27,7 +27,7 @@ class AudioSource:
 class Tests(unittest.TestCase):
     def setUp(self):
         self.env=patch.dict(os.environ, {'TWILIO_AUTH_TOKEN':'unit-test-only',
-            'HUME_SAMPLE_RATE':'48000', **{k:'unit-test-only' for k in app.KEYS}, 'HUME_VOICE_NAME':'test-only'})
+            'REALTIME_ENABLED':'1', 'HUME_SAMPLE_RATE':'48000', **{k:'unit-test-only' for k in app.KEYS}, 'HUME_VOICE_NAME':'test-only'})
         self.env.start(); self.addCleanup(self.env.stop)
     def test_signature(self):
         url='https://test.invalid/voice'; p={'CallSid':'CA-test','From':'+15550000000'}
@@ -47,6 +47,20 @@ class Tests(unittest.TestCase):
             self.assertIn('<Connect><Stream',r.text)
             self.assertNotIn('Gather',r.text)
             self.assertNotIn('unit-test-only',r.text)
+    def test_disabled_voice_does_not_stream(self):
+        with patch.object(app,'BASE','https://test.invalid'), patch.dict(os.environ, {'REALTIME_ENABLED':'0'}):
+            params={'CallSid':'CA-test'}
+            sig=RequestValidator('unit-test-only').compute_signature(app.BASE+'/voice',params)
+            r=TestClient(app.app).post('/voice',data=params,headers={'x-twilio-signature':sig})
+            self.assertNotIn('<Stream',r.text)
+            self.assertIn('<Hangup',r.text)
+    def test_router_without_key(self):
+        async def check():
+            with patch.dict(os.environ, {'TYPESAFE_API_KEY':''}):
+                s=app.Session(FakeSocket())
+                result=await s.route('Hello')
+                self.assertEqual(result,('capable',0,'fallback_no_jev_key'))
+        asyncio.run(check())
     def test_pcm_conversion(self):
         async def check():
             ws=FakeSocket(); session=app.Session(ws); ws.session=session; session.stream_sid='MZ-test'
