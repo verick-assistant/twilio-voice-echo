@@ -253,3 +253,17 @@ class BridgeTests(unittest.TestCase):
             with self.env(),patch.object(app,'bridge_publish',side_effect=publish):await s.request_brief()
             self.assertEqual(s.caller_brief,'Generic synthetic brief');self.assertEqual(seen[0]['type'],'context_brief_request');self.assertEqual(seen[0]['caller_identity'],'unverified');self.assertEqual(app.BRIEF_PENDING,{})
         asyncio.run(t())
+    def test_owner_name_synthesis_respelling(self):
+        class Budget:
+            limit=100
+            async def reserve(self,text):self.text=text;return 50
+        class TTS:
+            async def send(self,value):self.value=json.loads(value)
+        async def t():
+            s=app.Session(FakeSocket());s.budget=Budget();tts=TTS()
+            source={'text':"Verick's name is Verick, not Vericka.",'voice':{'id':'test'}}
+            await s.send_tts(tts,source,{})
+            self.assertEqual(tts.value['text'],"Vairick's name is Vairick, not Vericka.")
+            self.assertEqual(s.budget.text,tts.value['text'])
+            self.assertEqual(source['text'],"Verick's name is Verick, not Vericka.")
+        asyncio.run(t())
