@@ -61,6 +61,15 @@ class Tests(unittest.TestCase):
                 result=await s.route('Hello')
                 self.assertEqual(result,('capable',0,'fallback_no_jev_key'))
         asyncio.run(check())
+    def test_diagnostic_socket_disabled(self):
+        from starlette.websockets import WebSocketDisconnect
+        with patch.dict(os.environ, {'DIAGNOSTICS_ENABLED':'0','DIAGNOSTIC_TOKEN':'unit-test-only'}):
+            with self.assertRaises(WebSocketDisconnect):
+                with TestClient(app.app).websocket_connect('/diagnostic-stream',headers={'x-diagnostic-token':'unit-test-only'}):
+                    pass
+    def test_no_header_call_even_with_config(self):
+        with patch.dict(os.environ, {'CALL_TOKEN':'unit-test-only'}):
+            self.assertEqual(TestClient(app.app).post('/call').status_code,401)
     def test_pcm_conversion(self):
         async def check():
             ws=FakeSocket(); session=app.Session(ws); ws.session=session; session.stream_sid='MZ-test'
