@@ -342,7 +342,7 @@ class Session:
             self.pending_marks.add(mark)
             await self.send({'event': 'mark', 'streamSid': self.stream_sid, 'mark': {'name': mark}})
 
-    async def run(self):
+    async def run(self, diagnostic=False):
         async with httpx.AsyncClient() as self.client:
             try:
                 start = await asyncio.wait_for(self.ws.receive_json(), 8)
@@ -353,7 +353,8 @@ class Session:
                 expiry = parameters.get('expires', '0')
                 supplied = parameters.get('token', '')
                 sid = data.get('callSid', '')
-                if start.get('event') != 'start' or int(expiry) < time.time() or int(expiry) > time.time()+100 or not supplied or not hmac.compare_digest(supplied, stream_token(sid, expiry)):
+                valid_token = diagnostic or (int(expiry) >= time.time() and int(expiry) <= time.time()+100 and supplied and hmac.compare_digest(supplied, stream_token(sid, expiry)))
+                if start.get('event') != 'start' or not valid_token:
                     await self.ws.close(code=1008)
                     return
                 fmt = data.get('mediaFormat', {})
@@ -410,3 +411,15 @@ async def media_stream(ws: WebSocket):
         return
     await ws.accept()
     await Session(ws).run()
+
+
+@app.websocket('/diagnostic-stream')
+async def diagnostic_stream(ws: WebSocket):
+    # Private fixture tests only. No dialing. Disabled by default; independent token.
+    expected = os.getenv('DIAGNOSTIC_TOKEN', '')
+    supplied = ws.headers.get('x-diagnostic-token', '')
+    if os.getenv('DIAGNOSTICS_ENABLED') != '1' or not expected or not ready() or not hmac.compare_digest(expected, supplied):
+        await ws.close(code=1008)
+        return
+    await ws.accept()
+    await Session(ws).run(diagnostic=True)
