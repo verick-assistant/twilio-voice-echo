@@ -158,7 +158,34 @@ class BridgeTests(unittest.TestCase):
     def env(self):
         return patch.dict(os.environ, {'ISABELLE_BRIDGE_ENABLED':'1','ISABELLE_HUME_VOICE_ID':'voice-second',
             'HUME_VOICE_ID':'voice-first','BRIDGE_RESEND_API_KEY':'test','BRIDGE_MAIL_FROM':'test@example.invalid',
-            'BRIDGE_REPLY_SECRET':'unit-test-only','USAGE_REDIS_URL':'redis://test.invalid'})
+            'BRIDGE_HMAC_ENABLED':'1','BRIDGE_REPLY_SECRET':'unit-test-only','USAGE_REDIS_URL':'redis://test.invalid'})
+    def test_ed25519_auth_bound_replay_and_fail_closed(self):
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from unittest.mock import AsyncMock
+        import time
+        private = Ed25519PrivateKey.generate()
+        public = base64.b64encode(private.public_key().public_bytes_raw()).decode()
+        body = b'{"session_id":"missing","turn_id":"missing","text":"test"}'
+        stamp = str(int(time.time())); nonce = 'unique-test-nonce-123'
+        def headers(path='/isabelle/reply', timestamp=stamp, key_id='relay-test'):
+            message = (timestamp+'\n'+nonce+'\nPOST\n'+path+'\n').encode()+body
+            return {'x-bridge-key-id':key_id,'x-bridge-timestamp':timestamp,'x-bridge-nonce':nonce,
+                    'x-bridge-signature':base64.b64encode(private.sign(message)).decode()}
+        client = TestClient(app.app); redis = AsyncMock(); redis.set.return_value=True
+        with self.env(), patch.dict(os.environ, {'BRIDGE_HMAC_ENABLED':'0', 'BRIDGE_RELAY_PUBLIC_KEYS':json.dumps({'relay-test':public})}), patch.object(app,'bridge_client',return_value=redis):
+            self.assertTrue(app.bridge_ready())
+            self.assertEqual(client.post('/isabelle/reply',content=body,headers=headers()).status_code,409)
+            redis.set.assert_awaited_with('voice:bridge:v1:nonce:relay-test:'+nonce,'1',nx=True,ex=300)
+            redis.set.return_value=False
+            self.assertEqual(client.post('/isabelle/reply',content=body,headers=headers()).status_code,409)
+            for h in [headers(path='/isabelle/brief'), headers(timestamp=str(int(stamp)-121)), headers(key_id='wrong')]:
+                self.assertEqual(client.post('/isabelle/reply',content=body,headers=h).status_code,401)
+            self.assertEqual(client.post('/isabelle/reply',content=body+b' ',headers=headers()).status_code,401)
+            self.assertEqual(client.post('/isabelle/reply',content=body).status_code,401)
+            redis.set.side_effect=ConnectionError('offline')
+            self.assertEqual(client.post('/isabelle/reply',content=body,headers=headers()).status_code,503)
+        with self.env(), patch.dict(os.environ, {'BRIDGE_HMAC_ENABLED':'0','BRIDGE_RELAY_PUBLIC_KEYS':'invalid'}):
+            self.assertFalse(app.bridge_ready())
     def test_escalation_variants(self):
         for text in ['Let me speak to Isabelle.','Can I talk with Izzy?','Please speak directly to Isabelle','I want to talk to Izzy']:
             self.assertTrue(app.wants_isabelle(text), text)
