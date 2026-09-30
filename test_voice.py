@@ -163,6 +163,37 @@ class Tests(unittest.TestCase):
             self.assertEqual(ws.sent[0]['event'],'clear')
             self.assertFalse(session.playing)
         asyncio.run(check())
+    def test_short_pause_fragments_coalesce(self):
+        class DG:
+            def __aiter__(self): return self.run()
+            async def run(self):
+                for text in ['Let us see if you can', 'make note of', 'a request.']:
+                    yield json.dumps({'type':'Results','is_final':True,'speech_final':True,'channel':{'alternatives':[{'transcript':text}]}})
+                    await asyncio.sleep(.1)
+        async def check():
+            session=app.Session(FakeSocket());session.dg=DG();found=[]
+            async def handle(text):found.append(text)
+            session.handle_utterance=handle
+            await session.listen();await asyncio.sleep(.8)
+            self.assertEqual(found,['Let us see if you can make note of a request.'])
+        asyncio.run(check())
+    def test_noise_speech_start_does_not_cancel_audio(self):
+        class DG:
+            def __aiter__(self): return self.run()
+            async def run(self):yield json.dumps({'type':'SpeechStarted'})
+        async def check():
+            from unittest.mock import AsyncMock
+            session=app.Session(FakeSocket());session.dg=DG();session.playing=True;session.clear=AsyncMock()
+            await session.listen();await asyncio.sleep(.3);session.clear.assert_not_awaited()
+        asyncio.run(check())
+    def test_encoded_audio_rejected(self):
+        class Source:
+            def __aiter__(self):return self.run()
+            async def run(self):yield json.dumps({'audio':base64.b64encode(b'RIFFnot-raw-pcm').decode()})
+        async def check():
+            session=app.Session(FakeSocket())
+            with self.assertRaises(ValueError):await session.consume_tts(Source(),{'start':app.now()})
+        asyncio.run(check())
     def test_transcript_accumulation(self):
         class DG:
             def __aiter__(self): return self.run()
@@ -174,7 +205,7 @@ class Tests(unittest.TestCase):
             s=app.Session(FakeSocket()); s.dg=DG(); found=[]
             async def respond(t): found.append(t)
             s.respond=respond
-            await s.listen(); await asyncio.sleep(0)
+            await s.listen(); await asyncio.sleep(.8)
             self.assertEqual(found,['Hello world'])
         asyncio.run(check())
 
