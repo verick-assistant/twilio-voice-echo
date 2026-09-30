@@ -228,3 +228,28 @@ class BridgeTests(unittest.TestCase):
         for stamp,expected in [(str(int(time.time())-1000),401),(str(int(time.time())),409)]:
             sig=hmac.new(b'unit-test-only',stamp.encode()+b'.'+body,hashlib.sha256).hexdigest()
             with self.env():self.assertEqual(TestClient(app.app).post('/isabelle/reply',content=body,headers={'x-bridge-timestamp':stamp,'x-bridge-signature':sig}).status_code,expected)
+    def test_brief_requires_verified_authorized_audience(self):
+        import time,hmac,hashlib
+        async def t():
+            f=asyncio.get_running_loop().create_future();app.BRIEF_PENDING['brief-test']={'session_id':'s','future':f}
+            def post(value):
+                body=json.dumps(value).encode();stamp=str(int(time.time()));sig=hmac.new(b'unit-test-only',stamp.encode()+b'.'+body,hashlib.sha256).hexdigest()
+                return TestClient(app.app).post('/isabelle/brief',content=body,headers={'x-bridge-timestamp':stamp,'x-bridge-signature':sig})
+            base={'turn_id':'brief-test','session_id':'s','brief':'Public test context','source_reference':'test-only'}
+            with self.env():
+                self.assertEqual(post(base).status_code,403)
+                base.update(audience_verified=True,disclosure_authorized=True)
+                self.assertEqual(post(dict(base,brief='x'*1501)).status_code,422)
+                self.assertEqual(post(dict(base,session_id='wrong')).status_code,409)
+                self.assertEqual(post(base).status_code,200);self.assertEqual(f.result(),base['brief'])
+                self.assertEqual(post(base).status_code,409)
+            app.BRIEF_PENDING.clear()
+        asyncio.run(t())
+    def test_brief_request_no_speech_or_llm(self):
+        async def t():
+            s=app.Session(FakeSocket());s.call_sid='CA-test';seen=[]
+            async def publish(e):
+                seen.append(e);app.BRIEF_PENDING[e['turn_id']]['future'].set_result('Generic synthetic brief');return None
+            with self.env(),patch.object(app,'bridge_publish',side_effect=publish):await s.request_brief()
+            self.assertEqual(s.caller_brief,'Generic synthetic brief');self.assertEqual(seen[0]['type'],'context_brief_request');self.assertEqual(seen[0]['caller_identity'],'unverified');self.assertEqual(app.BRIEF_PENDING,{})
+        asyncio.run(t())
