@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 from fastapi.testclient import TestClient
 from twilio.request_validator import RequestValidator
-import app
+import v2 as app
 
 class FakeSocket:
     def __init__(self): self.sent=[]
@@ -244,9 +244,9 @@ class BridgeTests(unittest.TestCase):
         with self.env(), patch.dict(os.environ, {'BRIDGE_HMAC_ENABLED':'0','BRIDGE_RELAY_PUBLIC_KEYS':'invalid'}):
             self.assertFalse(app.bridge_ready())
     def test_escalation_variants(self):
-        for text in ['Let me speak to Isabelle.','Can I talk with Izzy?','Please speak directly to Isabelle','I want to talk to Izzy']:
+        for text in ['Let me speak to Isabelle.','Can I talk with Isabel?','Please speak directly to Isabelle','I want to talk to Isabelle']:
             self.assertTrue(app.wants_isabelle(text), text)
-        for text in ['Isabelle sounds nice','Izzy bought milk','Do not impersonate Izzy']:
+        for text in ['Isabelle sounds nice','Izzy bought milk','Do not impersonate Izzy','Let me speak to Izzy','Can I talk with Izzy?']:
             self.assertFalse(app.wants_isabelle(text), text)
     def test_bridge_disabled_or_same_voice(self):
         with self.env(), patch.dict(os.environ, {'ISABELLE_BRIDGE_ENABLED':'0'}): self.assertFalse(app.bridge_ready())
@@ -275,7 +275,7 @@ class BridgeTests(unittest.TestCase):
             s.speak_text=speak
             s.play_cached=__import__('unittest.mock',fromlist=['AsyncMock']).AsyncMock();s.respond=respond
             with patch.dict(os.environ,{'ISABELLE_BRIDGE_ENABLED':'0'}):
-                await s.handle_utterance('let me speak to Izzy');await asyncio.sleep(0)
+                await s.handle_utterance('let me speak to Isabelle');await asyncio.sleep(0)
                 await s.handle_utterance('Who am I?')
             self.assertEqual(s.mode,'isabelle');self.assertEqual(len(seen),1)
         asyncio.run(t())
@@ -515,9 +515,32 @@ class SpeechGuardTests(unittest.IsolatedAsyncioTestCase):
             await session.consume_tts(Runaway(), metric)
         self.assertTrue(metric['audio_overrun'])
         self.assertFalse(any(x['event'] == 'media' for x in ws.sent))
-    def test_full_reply_single_submit(self):
+    def test_live_streaming_avoids_tiny_first_generation(self):
         import inspect
         source = inspect.getsource(app.Session.respond)
-        self.assertEqual(source.count('await self.send_tts('), 1)
+        self.assertIn('len(pending.strip()) >= 24', source)
         self.assertIn("'close': True", source)
-        self.assertNotIn("'flush': True", source)
+        self.assertIn("'flush': True", source)
+
+    def test_post_call_speech_matching(self):
+        ok, scores = app.speech_match("I'll try Isabelle. One moment.", "I'll try Isabel. One moment.")
+        self.assertTrue(ok, scores)
+        ok, scores = app.speech_match("Hi. I'm the phone assistant.", "Jerry calls iTunes public services.")
+        self.assertFalse(ok, scores)
+        ok, scores = app.speech_match("I'm still waiting.", "I'm still waiting. My family would have been knowledge.")
+        self.assertFalse(ok, scores)
+    async def test_post_call_mismatch_quarantines_hume(self):
+        from unittest.mock import AsyncMock, patch
+        session = app.Session(FakeSocket())
+        session.client = object()
+        session.post_call_checks = [{'turn': 1, 'expected': 'Hello.', 'pcm': bytes(9600), 'rate': 48000, 'provider': 'hume'}]
+        with patch.object(app, 'deepgram_transcribe_pcm', AsyncMock(return_value=('completely unrelated speech', .99))), patch.object(app, 'HUME_QUARANTINE_UNTIL', 0.0):
+            await session.run_post_call_diagnostics()
+            self.assertTrue(app.hume_quarantined())
+            app.HUME_QUARANTINE_UNTIL = 0.0
+
+    def test_names_route_to_correct_agent(self):
+        self.assertTrue(app.wants_isabelle('Let me speak to Isabelle'))
+        self.assertFalse(app.wants_isabelle('Let me speak to Izzy'))
+        self.assertIn('You are Izzy, the fast front voice assistant', app.SYSTEM)
+        self.assertEqual(app.CACHED_TEXT['waiting'], "I'm still working on that, give me just a moment.")
