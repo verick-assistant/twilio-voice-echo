@@ -1,0 +1,83 @@
+import asyncio
+import base64
+import json
+import os
+import unittest
+from unittest.mock import patch
+from fastapi.testclient import TestClient
+from twilio.request_validator import RequestValidator
+import app
+
+class FakeSocket:
+    def __init__(self): self.sent=[]
+    async def send_json(self, msg):
+        self.sent.append(msg)
+        if msg.get('event') == 'mark' and hasattr(self, 'session'):
+            self.session.pending_marks.discard(msg['mark']['name'])
+    async def close(self, **kwargs): pass
+
+class AudioSource:
+    def __aiter__(self): return self.run()
+    async def run(self):
+        # 20 ms of known 16-bit PCM. Split at an odd byte boundary to test carry.
+        data=(1000).to_bytes(2,'little', signed=True)*960
+        for part in (data[:501],data[501:]):
+            yield json.dumps({'audio':base64.b64encode(part).decode()})
+
+class Tests(unittest.TestCase):
+    def setUp(self):
+        self.env=patch.dict(os.environ, {'TWILIO_AUTH_TOKEN':'unit-test-only',
+            'HUME_SAMPLE_RATE':'48000', **{k:'unit-test-only' for k in app.KEYS}, 'HUME_VOICE_NAME':'test-only'})
+        self.env.start(); self.addCleanup(self.env.stop)
+    def test_signature(self):
+        url='https://test.invalid/voice'; p={'CallSid':'CA-test','From':'+15550000000'}
+        sig=RequestValidator('unit-test-only').compute_signature(url,p)
+        self.assertTrue(app.signature_valid(url,p,sig))
+        self.assertFalse(app.signature_valid(url,p,sig+'bad'))
+    def test_rejects_call_without_header(self):
+        client=TestClient(app.app)
+        self.assertEqual(client.post('/call').status_code,401)
+        self.assertEqual(client.get('/call?token=x').status_code,405)
+    def test_signed_voice_connect(self):
+        with patch.object(app,'BASE','https://test.invalid'):
+            params={'CallSid':'CA-test'}
+            sig=RequestValidator('unit-test-only').compute_signature(app.BASE+'/voice',params)
+            r=TestClient(app.app).post('/voice',data=params,headers={'x-twilio-signature':sig})
+            self.assertEqual(r.status_code,200)
+            self.assertIn('<Connect><Stream',r.text)
+            self.assertNotIn('Gather',r.text)
+            self.assertNotIn('unit-test-only',r.text)
+    def test_pcm_conversion(self):
+        async def check():
+            ws=FakeSocket(); session=app.Session(ws); ws.session=session; session.stream_sid='MZ-test'
+            await session.consume_tts(AudioSource(),{'start':app.now()})
+            audio=b''.join(base64.b64decode(m['media']['payload']) for m in ws.sent if m['event']=='media')
+            self.assertEqual(len(audio),160)
+            self.assertLess(abs(int.from_bytes(app.audioop.ulaw2lin(audio[:1],2),'little',signed=True)-1000),40)
+            self.assertTrue(any(m['event']=='mark' for m in ws.sent))
+        asyncio.run(check())
+    def test_barge_in_cancel(self):
+        async def check():
+            ws=FakeSocket(); session=app.Session(ws); session.stream_sid='MZ-test'; session.playing=True
+            session.turn=asyncio.create_task(asyncio.sleep(30))
+            await session.clear()
+            self.assertTrue(session.turn.cancelled())
+            self.assertEqual(ws.sent[0]['event'],'clear')
+            self.assertFalse(session.playing)
+        asyncio.run(check())
+    def test_transcript_accumulation(self):
+        class DG:
+            def __aiter__(self): return self.run()
+            async def run(self):
+                for text,final in [('Hello',False),('world',True)]:
+                    yield json.dumps({'type':'Results','is_final':True,'speech_final':final,
+                        'channel':{'alternatives':[{'transcript':text}]}})
+        async def check():
+            s=app.Session(FakeSocket()); s.dg=DG(); found=[]
+            async def respond(t): found.append(t)
+            s.respond=respond
+            await s.listen(); await asyncio.sleep(0)
+            self.assertEqual(found,['Hello world'])
+        asyncio.run(check())
+
+if __name__=='__main__': unittest.main()
