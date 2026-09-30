@@ -72,7 +72,7 @@ class TTSBudget:
 
 log = logging.getLogger('voice')
 app = FastAPI()
-VERSION = '2.2.1'
+VERSION = '2.2.2'
 BASE = os.getenv('BASE_URL', '').rstrip('/')
 KEYS = ('DEEPGRAM_API_KEY', 'OPENROUTER_API_KEY', 'HUME_API_KEY', 'TYPESAFE_API_KEY')
 # Model IDs are configurable and must be validated against OpenRouter before live use.
@@ -562,6 +562,10 @@ class Session:
     async def send_tts(self, tts, payload, metric):
         text = payload.get('text', '')
         if text:
+            # Owner pronunciation: V-Air-ick, like Derrick with a V.
+            # Change only synthesis text; preserve relay replies/history verbatim.
+            text = re.sub(r'\bVerick\b', 'Vairick', text, flags=re.IGNORECASE)
+            payload = dict(payload, text=text)
             remaining = await self.budget.reserve(text)
             metric['tts_characters_reserved'] = metric.get('tts_characters_reserved', 0) + len(text)
             metric['tts_budget_remaining'] = remaining
