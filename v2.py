@@ -74,7 +74,7 @@ class TTSBudget:
 
 log = logging.getLogger('voice')
 app = FastAPI()
-VERSION = '2.3.0'
+VERSION = '2.3.1'
 BASE = os.getenv('BASE_URL', '').rstrip('/')
 KEYS = ('DEEPGRAM_API_KEY', 'OPENROUTER_API_KEY', 'HUME_API_KEY')
 # Model IDs are configurable and must be validated against OpenRouter before live use.
@@ -329,7 +329,7 @@ async def voice(request: Request):
     body = (f'<Response><Connect><Stream url="{html.escape(url, quote=True)}">'
             f'<Parameter name="expires" value="{expiry}"/>'
             f'<Parameter name="token" value="{stream_token(sid, expiry)}"/>'
-            '</Stream></Connect></Response>')
+            '</Stream></Connect><Hangup/></Response>')
     return Response(body, media_type='text/xml')
 
 
@@ -736,6 +736,10 @@ class Session:
             self.pending_marks.add(mark)
             await self.send({'event': 'mark', 'streamSid': self.stream_sid, 'mark': {'name': mark}})
 
+    async def enforce_session_limit(self, seconds):
+        await asyncio.sleep(seconds)
+        await self.ws.close(code=1000)
+
     async def run(self, diagnostic=False):
         async with httpx.AsyncClient() as self.client:
             try:
@@ -757,6 +761,9 @@ class Session:
                     return
                 self.stream_sid = start['streamSid']
                 self.call_sid = sid
+                if not diagnostic:
+                    limit = max(1, min(int(os.getenv('CALL_MAX_SECONDS', '1200')), 1200))
+                    self.spawn(self.enforce_session_limit(limit))
                 if diagnostic and parameters.get('initial_mode') == 'isabelle' and bridge_ready():
                     self.mode = 'isabelle'
                 self.brief_task = self.spawn(self.request_brief())
