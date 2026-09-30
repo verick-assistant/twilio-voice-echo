@@ -20,6 +20,55 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 from twilio.request_validator import RequestValidator
 
+
+import redis.asyncio as redis
+
+class BudgetUnavailable(RuntimeError):
+    pass
+
+SCRIPT = '''
+local used = tonumber(redis.call('GET', KEYS[1]) or '0')
+local amount = tonumber(ARGV[1])
+local limit = tonumber(ARGV[2])
+if amount < 1 or used + amount > limit then return {-1, used} end
+local next = redis.call('INCRBY', KEYS[1], amount)
+redis.call('EXPIREAT', KEYS[1], ARGV[3])
+return {next, limit-next}
+'''
+
+class TTSBudget:
+    def __init__(self):
+        self.url = os.getenv('USAGE_REDIS_URL', '')
+        self.limit = int(os.getenv('HUME_BUDGET_CHARACTERS', '0'))
+        self.period_end = int(os.getenv('HUME_BUDGET_PERIOD_END', '0'))
+        self.verified = os.getenv('HUME_BUDGET_VERIFIED') == '1'
+        self.scope = os.getenv('HUME_BUDGET_SCOPE', '')
+        self.client = redis.from_url(self.url, socket_timeout=2, socket_connect_timeout=2) if self.url else None
+
+    def configured(self):
+        return bool(self.client and self.verified and self.scope and self.limit>0 and self.period_end>time.time())
+
+    async def reserve(self, text):
+        if not self.configured():
+            raise BudgetUnavailable('unverified_or_expired_tts_budget')
+        # Charge Unicode code points conservatively, with headroom configured in the allowance.
+        amount = len(text)
+        if not amount:
+            return 0
+        try:
+            used, remaining = await self.client.eval(SCRIPT, 1,
+                f'voice:tts:{self.scope}:{self.period_end}', amount, self.limit, self.period_end)
+        except Exception as exc:
+            raise BudgetUnavailable('tts_budget_ledger_unavailable') from None
+        if used < 0:
+            raise BudgetUnavailable('tts_allowance_exhausted')
+        return int(remaining)
+
+    async def close(self):
+        if self.client:
+            await self.client.aclose()
+
+
 log = logging.getLogger('voice')
 app = FastAPI()
 VERSION = '2.0.0'
@@ -58,6 +107,7 @@ def ready():
 async def health():
     return {'ok': True, 'version': VERSION, 'realtime_ready': ready(), 'realtime_enabled': os.getenv('REALTIME_ENABLED') == '1',
             'providers': {k.removesuffix('_API_KEY').lower(): bool(os.getenv(k)) for k in KEYS},
+            'tts_budget_configured': TTSBudget().configured(),
             'voice_configured': bool(os.getenv('HUME_VOICE_ID') or os.getenv('HUME_VOICE_NAME')),
             'twilio_env': bool(os.getenv('TWILIO_ACCOUNT_SID') and os.getenv('TWILIO_AUTH_TOKEN'))}
 
@@ -103,6 +153,7 @@ async def call(request: Request):
 class Session:
     def __init__(self, ws):
         self.ws = ws
+        self.budget = TTSBudget()
         self.stream_sid = ''
         self.tasks = set()
         self.turn = None
@@ -220,7 +271,21 @@ class Session:
                         metric['llm_first_token_ms'] = round((now()-metric['start'])*1000)
                     yield delta
 
+    async def send_tts(self, tts, payload, metric):
+        text = payload.get('text', '')
+        if text:
+            remaining = await self.budget.reserve(text)
+            metric['tts_characters_reserved'] = metric.get('tts_characters_reserved', 0) + len(text)
+            metric['tts_budget_remaining'] = remaining
+            if remaining <= self.budget.limit * .1:
+                metric['tts_budget_warning'] = 'near_allowance_limit'
+                log.warning('tts_budget_near_limit remaining=%d', remaining)
+        await tts.send(json.dumps(payload))
+
     async def respond(self, text):
+        if not self.budget.configured():
+            log.warning('voice_reply_blocked unverified_tts_budget')
+            return
         metric = {'turn': self.turn_index, 'start': now()}
         response_text = ''
         # Connect TTS while the route resolves, hiding connection setup behind routing.
@@ -248,15 +313,15 @@ class Session:
                 pending += delta
                 # Preserve phrase prosody, but flush the first short phrase promptly.
                 if any(p in pending for p in '.!?;\n') or (first and len(pending) >= 45 and ' ' in pending):
-                    await tts.send(json.dumps({'text': pending, 'voice': voice, 'flush': True,
-                                              'description': 'Warm, clear, natural conversational delivery.'}))
+                    await self.send_tts(tts, {'text': pending, 'voice': voice, 'flush': True,
+                                              'description': 'Warm, clear, natural conversational delivery.'}, metric)
                     pending = ''
                     first = False
                 elif len(pending) >= 140:
-                    await tts.send(json.dumps({'text': pending, 'voice': voice, 'flush': True}))
+                    await self.send_tts(tts, {'text': pending, 'voice': voice, 'flush': True}, metric)
                     pending = ''
             if pending:
-                await tts.send(json.dumps({'text': pending, 'voice': voice, 'flush': True}))
+                await self.send_tts(tts, {'text': pending, 'voice': voice, 'flush': True}, metric)
             await tts.send(json.dumps({'close': True}))
             await asyncio.wait_for(consumer, timeout=30)
             self.history.extend([{'role': 'user', 'content': text}, {'role': 'assistant', 'content': response_text}])
@@ -400,6 +465,7 @@ class Session:
                     task.cancel()
                 await asyncio.gather(*list(self.tasks), return_exceptions=True)
                 self.history.clear()
+                await self.budget.close()
 
 
 @app.websocket('/media-stream')
