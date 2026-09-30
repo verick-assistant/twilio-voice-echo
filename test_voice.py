@@ -40,7 +40,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(client.get('/call?token=x').status_code,405)
     def test_signed_voice_connect(self):
         with patch.object(app,'BASE','https://test.invalid'):
-            params={'CallSid':'CA-test'}
+            params={'CallSid':'CA-test','From':'+17865271894'}
             sig=RequestValidator('unit-test-only').compute_signature(app.BASE+'/voice',params)
             r=TestClient(app.app).post('/voice',data=params,headers={'x-twilio-signature':sig})
             self.assertEqual(r.status_code,200)
@@ -49,7 +49,7 @@ class Tests(unittest.TestCase):
             self.assertNotIn('unit-test-only',r.text)
     def test_disabled_voice_does_not_stream(self):
         with patch.object(app,'BASE','https://test.invalid'), patch.dict(os.environ, {'REALTIME_ENABLED':'0'}):
-            params={'CallSid':'CA-test'}
+            params={'CallSid':'CA-test','From':'+17865271894'}
             sig=RequestValidator('unit-test-only').compute_signature(app.BASE+'/voice',params)
             r=TestClient(app.app).post('/voice',data=params,headers={'x-twilio-signature':sig})
             self.assertNotIn('<Stream',r.text)
@@ -64,7 +64,7 @@ class Tests(unittest.TestCase):
                 socket.close.assert_awaited_once_with(code=1000)
         asyncio.run(check())
         with patch.object(app,'BASE','https://test.invalid'):
-            params={'CallSid':'CA-test'}
+            params={'CallSid':'CA-test','From':'+17865271894'}
             sig=RequestValidator('unit-test-only').compute_signature(app.BASE+'/voice',params)
             result=TestClient(app.app).post('/voice',data=params,headers={'x-twilio-signature':sig})
             self.assertIn('</Stream></Connect><Hangup/>',result.text)
@@ -379,3 +379,47 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(s.budget.text,tts.value['text'])
             self.assertEqual(source['text'],"Verick's name is Verick, not Vericka.")
         asyncio.run(t())
+
+class RecordingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cipher_and_events(self):
+        from unittest.mock import AsyncMock, MagicMock
+        with patch.dict(os.environ, {'USAGE_REDIS_URL':'redis://localhost:6379','TWILIO_AUTH_TOKEN':'private-fixture'}):
+            c=app.CallCapture('CA'+'a'*32, 'a'*24)
+            fake=MagicMock(); pipe=MagicMock();pipe.execute=AsyncMock();fake.pipeline.return_value=pipe
+            c.client=fake
+            c.add('stt_final', transcript="What's on my calendar for Friday?")
+            await c.flush()
+            key, sealed=pipe.rpush.call_args.args
+            self.assertNotIn(b'calendar',sealed)
+            decoded=json.loads(c.cipher.decrypt(sealed[:12],sealed[12:],key.encode()))
+            self.assertEqual(decoded[0]['transcript'],"What's on my calendar for Friday?")
+            self.assertLessEqual(c.retention,30*86400)
+    async def test_storage_failure_fail_closed(self):
+        from unittest.mock import AsyncMock, MagicMock
+        with patch.dict(os.environ, {'USAGE_REDIS_URL':'redis://localhost:6379','TWILIO_AUTH_TOKEN':'private-fixture'}):
+            c=app.CallCapture('CA'+'a'*32, 'a'*24)
+            fake=MagicMock(); pipe=MagicMock();pipe.execute=AsyncMock(side_effect=RuntimeError());fake.pipeline.return_value=pipe;c.client=fake
+            c.add('inbound_media',payload='abcd')
+            with self.assertRaisesRegex(RuntimeError,'recording_storage_failed'):await c.flush()
+            with self.assertRaises(RuntimeError):c.add('more')
+    async def test_provider_request_dual(self):
+        from unittest.mock import AsyncMock, MagicMock
+        with patch.dict(os.environ,{'TWILIO_RECORDING_ENABLED':'1','TWILIO_ACCOUNT_SID':'AC'+'a'*32,'TWILIO_AUTH_TOKEN':'test'}):
+            client=MagicMock();response=MagicMock();response.json.return_value={'sid':'RE'+'b'*32,'channels':2};client.post=AsyncMock(return_value=response)
+            with patch.object(app,'bridge_client') as factory:
+                factory.return_value.zadd=AsyncMock();factory.return_value.aclose=AsyncMock()
+                await app.start_provider_recording(client,'CA'+'a'*32)
+            data=client.post.call_args.kwargs['data']
+            self.assertEqual(data['RecordingChannels'],'dual');self.assertEqual(data['RecordingTrack'],'both')
+    async def test_no_recording_auth_public_access(self):
+        r=TestClient(app.app).get('/recordings');self.assertEqual(r.status_code,401)
+        r=TestClient(app.app).get('/recordings/'+'a'*24);self.assertEqual(r.status_code,401)
+    async def test_noise_does_not_strand_final(self):
+        class STT:
+            def __aiter__(self):return self.run()
+            async def run(self):
+                yield json.dumps({'type':'Results','is_final':True,'speech_final':True,'channel':{'alternatives':[{'transcript':'calendar Friday'}]}})
+                yield json.dumps({'type':'SpeechStarted'})
+        from unittest.mock import AsyncMock
+        s=app.Session(FakeSocket());s.dg=STT();s.handle_utterance=AsyncMock();await s.listen();await asyncio.sleep(.8)
+        s.handle_utterance.assert_awaited_once_with('calendar Friday')
