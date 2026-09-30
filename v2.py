@@ -378,6 +378,10 @@ class Session:
         self.started = now()
         self.turn_index = 0
         self.closed = False
+        self.inbound_frames = 0
+        self.inbound_bytes = 0
+        self.uploaded_bytes = 0
+        self.stt_final_count = 0
         self.audio_queue = asyncio.Queue(maxsize=250) # five seconds of inbound 20ms audio
         self.pending_marks = set()
         self.mark_sent = {}
@@ -478,6 +482,7 @@ class Session:
                     self.route_task = self.spawn(self.route(text))
             if msg.get('is_final') and text:
                 self.final_parts.append(text)
+                self.stt_final_count += 1
                 log.warning('voice_stt_fragment session=%s characters=%d speech_final=%s', self.session_id, len(text), bool(msg.get('speech_final')))
             if self.final_parts and (msg.get('is_final') or msg.get('speech_final')):
                 delay = max(.3, float(os.getenv('FRAGMENT_HOLD_MS', '700')) / 1000)
@@ -528,6 +533,7 @@ class Session:
                 return
             try:
                 self.bridge_queue.put_nowait((self.turn_index, text[:4000]))
+                log.warning('voice_bridge_queued session=%s turn=%d characters=%d queue_depth=%d', self.session_id, self.turn_index, len(text), self.bridge_queue.qsize())
             except asyncio.QueueFull:
                 self.turn = self.spawn(self.speak_text("Please wait for Isabelle to answer before adding more.", os.environ['HUME_VOICE_ID']))
                 return
@@ -539,6 +545,7 @@ class Session:
     async def process_bridge(self):
         while True:
             sequence, text = await self.bridge_queue.get()
+            log.warning('voice_bridge_dequeued session=%s turn=%d queue_depth=%d', self.session_id, sequence, self.bridge_queue.qsize())
             turn_id = secrets.token_urlsafe(20)
             future = asyncio.get_running_loop().create_future()
             BRIDGE_PENDING[turn_id] = {'session_id': self.session_id, 'future': future, 'stream_id': None}
@@ -613,6 +620,7 @@ class Session:
             try:
                 audio = await asyncio.wait_for(self.audio_queue.get(), timeout=4)
                 await self.dg.send(audio)
+                self.uploaded_bytes += len(audio)
             except asyncio.TimeoutError:
                 await self.dg.send(json.dumps({'type': 'KeepAlive'}))
 
@@ -846,6 +854,8 @@ class Session:
                             payload = base64.b64decode(msg['media']['payload'], validate=True)
                             if len(payload) > 8000:
                                 raise ValueError('oversized_media')
+                            self.inbound_frames += 1
+                            self.inbound_bytes += len(payload)
                             self.audio_queue.put_nowait(payload)
                         elif msg.get('event') == 'mark':
                             mark_name = msg.get('mark', {}).get('name')
@@ -862,6 +872,7 @@ class Session:
                 with contextlib.suppress(Exception):
                     await self.ws.close(code=1011)
             finally:
+                log.warning('voice_session_summary session=%s inbound_frames=%d inbound_bytes=%d uploaded_bytes=%d stt_finals=%d queued_fragments=%d turns=%d', self.session_id, self.inbound_frames, self.inbound_bytes, self.uploaded_bytes, self.stt_final_count, self.bridge_queue.qsize(), self.turn_index)
                 for task in list(self.tasks):
                     task.cancel()
                 await asyncio.gather(*list(self.tasks), return_exceptions=True)
