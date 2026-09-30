@@ -42,6 +42,22 @@ redis.call('EXPIREAT', KEYS[1], ARGV[3])
 return {next, limit-next}
 '''
 
+def complete_speech_text(text, limit=360):
+    text = re.sub(r'\s+', ' ', text).strip()
+    if not text:
+        raise ValueError('empty_speech')
+    if len(text) > limit:
+        short = text[:limit]
+        ends = list(re.finditer(r'[.!?](?:["\']?)(?:\s|$)', short))
+        text = short[:ends[-1].end()].strip() if ends else short.rsplit(' ', 1)[0].rstrip(',;:') + '.'
+    if text[-1] not in '.!?':
+        text += '.'
+    return text
+
+def speech_audio_limit(text):
+    # Conservative normal speaking duration plus headroom, never unbounded.
+    return min(35.0, max(4.0, 2.0 + len(text) / 12.0))
+
 class TTSBudget:
     def __init__(self):
         self.url = os.getenv('USAGE_REDIS_URL', '')
@@ -77,7 +93,7 @@ class TTSBudget:
 
 log = logging.getLogger('voice')
 app = FastAPI()
-VERSION = '2.8.1'
+VERSION = '2.8.2'
 BASE = os.getenv('BASE_URL', '').rstrip('/')
 KEYS = ('DEEPGRAM_API_KEY', 'OPENROUTER_API_KEY', 'HUME_API_KEY')
 # Model IDs are configurable and must be validated against OpenRouter before live use.
@@ -836,8 +852,8 @@ class Session:
             async with websockets.connect('wss://api.hume.ai/v0/tts/stream/input?' + query, open_timeout=8) as tts:
                 consumer = self.spawn(self.consume_tts(tts, metric))
                 try:
-                    await self.send_tts(tts, {'text': text, 'voice': {'id': voice_id, 'provider': os.getenv('ISABELLE_HUME_VOICE_PROVIDER', 'CUSTOM_VOICE') if voice_id == os.getenv('ISABELLE_HUME_VOICE_ID') else 'HUME_AI'}, 'flush': True, 'speed': 0.97}, metric)
-                    await tts.send(json.dumps({'close': True}))
+                    text = complete_speech_text(text, limit=4000)
+                    await self.send_tts(tts, {'text': text, 'voice': {'id': voice_id, 'provider': os.getenv('ISABELLE_HUME_VOICE_PROVIDER', 'CUSTOM_VOICE') if voice_id == os.getenv('ISABELLE_HUME_VOICE_ID') else 'HUME_AI'}, 'close': True, 'speed': 0.97}, metric)
                     await asyncio.wait_for(consumer, 30)
                     metric['completed'] = True
                     metric['pending_marks_at_completion'] = len(self.pending_marks)
@@ -850,6 +866,8 @@ class Session:
             raise
         except Exception as exc:
             metric['error_type'] = type(exc).__name__
+            await self.send({'event': 'clear', 'streamSid': self.stream_sid})
+            self.playing = False
             log.warning('bridge_audio_stopped %s', type(exc).__name__)
         finally:
             metric['total_ms'] = round((now()-metric.pop('start'))*1000)
@@ -898,6 +916,9 @@ class Session:
             # Change only synthesis text; preserve relay replies/history verbatim.
             text = re.sub(r'\bVerick\b', 'Vairick', text, flags=re.IGNORECASE)
             payload = dict(payload, text=text)
+            metric['audio_limit_seconds'] = speech_audio_limit(text)
+            if self.capture:
+                self.capture.add('tts_request', turn=self.turn_index, text=text, close=bool(payload.get('close')))
             remaining = await self.budget.reserve(text)
             metric['tts_characters_reserved'] = metric.get('tts_characters_reserved', 0) + len(text)
             metric['tts_budget_remaining'] = remaining
@@ -930,25 +951,15 @@ class Session:
             tts = await tts_task
             consumer = asyncio.create_task(self.consume_tts(tts, metric))
             voice = {'id': os.environ['HUME_VOICE_ID'], 'provider': 'HUME_AI'} if os.getenv('HUME_VOICE_ID') else {'name': os.environ['HUME_VOICE_NAME'], 'provider': 'HUME_AI'}
-            pending = ''
-            first = True
+            # Buffer one complete reply. Short punctuation deltas must not trigger
+            # independent generations; close submits the utterance exactly once.
             async for delta in self.llm(text, MODELS[choice], metric):
                 response_text += delta
-                pending += delta
-                # Preserve phrase prosody, but flush the first short phrase promptly.
-                if re.search(r'[.!?](?:[\"\']?)(?:\s|$)', pending):
-                    await self.send_tts(tts, {'text': pending, 'voice': voice, 'flush': True,
-                                              'speed': 0.97}, metric)
-                    pending = ''
-                    first = False
-                elif len(pending) >= 240 and re.search(r'[,;:]\s*$', pending):
-                    await self.send_tts(tts, {'text': pending, 'voice': voice, 'flush': True,
-                                              'speed': 0.97}, metric)
-                    pending = ''
-            if pending:
-                await self.send_tts(tts, {'text': pending, 'voice': voice, 'flush': True,
-                                              'speed': 0.97}, metric)
-            await tts.send(json.dumps({'close': True}))
+            response_text = complete_speech_text(response_text)
+            if self.capture:
+                self.capture.add('llm_reply', turn=self.turn_index, text=response_text, model=MODELS[choice])
+            await self.send_tts(tts, {'text': response_text, 'voice': voice,
+                                      'close': True, 'speed': 0.97}, metric)
             await asyncio.wait_for(consumer, timeout=30)
             self.history.extend([{'role': 'user', 'content': text}, {'role': 'assistant', 'content': response_text}])
             self.history = self.history[-12:]
@@ -993,6 +1004,12 @@ class Session:
             if not encoded:
                 continue
             decoded = base64.b64decode(encoded, validate=True)
+            limit = metric.get('audio_limit_seconds')
+            if limit is not None and metric.get('pcm_bytes', 0) + len(decoded) > int(limit * source_rate * 2):
+                metric['audio_overrun'] = True
+                if self.capture:
+                    self.capture.add('tts_overrun', turn=self.turn_index, limit_seconds=limit)
+                raise RuntimeError('tts_audio_overrun')
             if decoded.startswith((b'RIFF', b'ID3', b'OggS')):
                 raise ValueError('unexpected_encoded_audio_format')
             if self.capture:
