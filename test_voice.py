@@ -68,6 +68,18 @@ class Tests(unittest.TestCase):
             sig=RequestValidator('unit-test-only').compute_signature(app.BASE+'/voice',params)
             result=TestClient(app.app).post('/voice',data=params,headers={'x-twilio-signature':sig})
             self.assertIn('</Stream></Connect><Hangup/>',result.text)
+    def test_websocket_signature_uses_configured_wss_url(self):
+        from starlette.websockets import WebSocketDisconnect
+        from unittest.mock import AsyncMock
+        client=TestClient(app.app)
+        with patch.object(app,'BASE','https://test.invalid'), patch.object(app.Session,'run',new_callable=AsyncMock):
+            for url in ['wss://test.invalid/media-stream','wss://test.invalid/media-stream/']:
+                sig=RequestValidator('unit-test-only').compute_signature(url,{})
+                with client.websocket_connect('/media-stream',headers={'x-twilio-signature':sig}):pass
+            for url in ['https://test.invalid/media-stream','wss://evil.invalid/media-stream']:
+                sig=RequestValidator('unit-test-only').compute_signature(url,{})
+                with self.assertRaises(WebSocketDisconnect):
+                    with client.websocket_connect('/media-stream',headers={'x-twilio-signature':sig}):pass
     def test_router_without_key(self):
         async def check():
             with patch.dict(os.environ, {'OPENROUTER_API_KEY':''}):
