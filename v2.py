@@ -72,7 +72,7 @@ class TTSBudget:
 
 log = logging.getLogger('voice')
 app = FastAPI()
-VERSION = '2.2.0'
+VERSION = '2.2.1'
 BASE = os.getenv('BASE_URL', '').rstrip('/')
 KEYS = ('DEEPGRAM_API_KEY', 'OPENROUTER_API_KEY', 'HUME_API_KEY', 'TYPESAFE_API_KEY')
 # Model IDs are configurable and must be validated against OpenRouter before live use.
@@ -716,6 +716,8 @@ class Session:
                     return
                 self.stream_sid = start['streamSid']
                 self.call_sid = sid
+                if diagnostic and parameters.get('initial_mode') == 'isabelle' and bridge_ready():
+                    self.mode = 'isabelle'
                 self.brief_task = self.spawn(self.request_brief())
                 query = urlencode({'model': 'nova-3', 'encoding': 'mulaw', 'sample_rate': 8000,
                                    'channels': 1, 'interim_results': 'true', 'vad_events': 'true',
