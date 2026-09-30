@@ -12,6 +12,8 @@ import os
 import secrets
 import time
 import re
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.exceptions import InvalidSignature
 from collections import deque
 from urllib.parse import urlencode
 
@@ -72,7 +74,7 @@ class TTSBudget:
 
 log = logging.getLogger('voice')
 app = FastAPI()
-VERSION = '2.2.3'
+VERSION = '2.3.0'
 BASE = os.getenv('BASE_URL', '').rstrip('/')
 KEYS = ('DEEPGRAM_API_KEY', 'OPENROUTER_API_KEY', 'HUME_API_KEY')
 # Model IDs are configurable and must be validated against OpenRouter before live use.
@@ -98,9 +100,21 @@ BRIDGE_STREAM = 'voice:bridge:v1:utterances'
 BRIDGE_GROUP = 'isabelle-relay-v1'
 BRIDGE_HEARTBEAT = 'voice:bridge:v1:relay-live'
 
+def relay_public_keys():
+    try:
+        raw = json.loads(os.getenv('BRIDGE_RELAY_PUBLIC_KEYS', '{}'))
+        if not isinstance(raw, dict) or len(raw) > 10:
+            return {}
+        return {key_id: Ed25519PublicKey.from_public_bytes(base64.b64decode(value, validate=True))
+                for key_id, value in raw.items()
+                if re.fullmatch(r'[a-zA-Z0-9_-]{1,64}', key_id)}
+    except (ValueError, TypeError):
+        return {}
+
 def bridge_ready():
     return (os.getenv('ISABELLE_BRIDGE_ENABLED') == '1'
-        and all(os.getenv(k) for k in ('ISABELLE_HUME_VOICE_ID', 'USAGE_REDIS_URL', 'BRIDGE_REPLY_SECRET'))
+        and all(os.getenv(k) for k in ('ISABELLE_HUME_VOICE_ID', 'USAGE_REDIS_URL'))
+        and bool(relay_public_keys() or (os.getenv('BRIDGE_HMAC_ENABLED') == '1' and os.getenv('BRIDGE_REPLY_SECRET')))
         and os.getenv('ISABELLE_HUME_VOICE_ID') != os.getenv('HUME_VOICE_ID'))
 
 def bridge_mail_ready():
@@ -148,9 +162,32 @@ async def bridge_auth(request):
             return None, 401
     except ValueError:
         return None, 401
-    expected = hmac.new(os.environ['BRIDGE_REPLY_SECRET'].encode(), stamp.encode()+b'.'+body, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(expected, supplied):
-        return None, 401
+    key_id = request.headers.get('x-bridge-key-id', '')
+    if key_id:
+        public = relay_public_keys().get(key_id)
+        nonce = request.headers.get('x-bridge-nonce', '')
+        if public is None or not re.fullmatch(r'[a-zA-Z0-9_-]{16,128}', nonce):
+            return None, 401
+        message = (stamp + '\n' + nonce + '\n' + request.method.upper() + '\n' + request.url.path + '\n').encode() + body
+        try:
+            public.verify(base64.b64decode(supplied, validate=True), message)
+        except (InvalidSignature, ValueError, TypeError):
+            return None, 401
+        client = bridge_client()
+        try:
+            if not await client.set('voice:bridge:v1:nonce:' + key_id + ':' + nonce, '1', nx=True, ex=300):
+                return None, 409
+        except Exception:
+            return None, 503
+        finally:
+            await client.aclose()
+    else:
+        # Legacy fixture path is opt-in and off by default; never share this secret with the relay.
+        if os.getenv('BRIDGE_HMAC_ENABLED') != '1' or not os.getenv('BRIDGE_REPLY_SECRET'):
+            return None, 401
+        expected = hmac.new(os.environ['BRIDGE_REPLY_SECRET'].encode(), stamp.encode()+b'.'+body, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, supplied):
+            return None, 401
     return body, None
 
 @app.post('/isabelle/relay/next')
