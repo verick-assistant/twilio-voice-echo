@@ -51,7 +51,7 @@ def stream_token(call_sid, expiry):
 
 
 def ready():
-    return all(os.getenv(k) for k in KEYS) and bool(os.getenv('HUME_VOICE_ID') or os.getenv('HUME_VOICE_NAME'))
+    return all(os.getenv(k) for k in KEYS if k != 'TYPESAFE_API_KEY') and bool(os.getenv('HUME_VOICE_ID') or os.getenv('HUME_VOICE_NAME'))
 
 
 @app.get('/health')
@@ -141,6 +141,8 @@ class Session:
     async def route(self, text):
         # Start on interim text; never block STT/audio transport on routing.
         start = now()
+        if not os.getenv('TYPESAFE_API_KEY'):
+            return 'capable', 0, 'fallback_no_jev_key'
         criteria = {'fast': 'Short conversation, simple facts, or clarification. Minimize latency and cost.',
                     'capable': 'Complex reasoning, technical planning, sensitive or ambiguous requests. Prioritize capability.'}
         try:
@@ -238,7 +240,7 @@ class Session:
             metric.update(route_ms=latency, route_source=source, model=MODELS[choice])
             tts = await tts_task
             consumer = asyncio.create_task(self.consume_tts(tts, metric))
-            voice = {'id': os.environ['HUME_VOICE_ID']} if os.getenv('HUME_VOICE_ID') else {'name': os.environ['HUME_VOICE_NAME']}
+            voice = {'id': os.environ['HUME_VOICE_ID'], 'provider': 'HUME_AI'} if os.getenv('HUME_VOICE_ID') else {'name': os.environ['HUME_VOICE_NAME'], 'provider': 'HUME_AI'}
             pending = ''
             first = True
             async for delta in self.llm(text, MODELS[choice], metric):
