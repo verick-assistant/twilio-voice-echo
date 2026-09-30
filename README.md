@@ -45,3 +45,18 @@ Run local tests: `python -m unittest -v test_voice.py`. Mock tests cover signatu
 - https://openrouter.ai/docs/api/reference/streaming
 - https://dev.hume.ai/reference/text-to-speech-tts/stream-input.mdx
 - https://raw.githubusercontent.com/HumeAI/hume-python-sdk/main/src/hume/empathic_voice/chat/audio/audio_utilities.py
+
+## Hume allowance guard
+
+Paid TTS is blocked until an account-wide budget is verified and a durable Redis ledger is configured. No Redis service is provisioned by this repository. Missing, expired, exhausted, or unavailable budget stops synthesis. Characters are atomically reserved BEFORE every TTS phrase is sent; failed or interrupted requests do not refund reservations because billing may already have occurred.
+
+Required guard configuration:
+- USAGE_REDIS_URL: durable, authenticated Redis connection, stored only as a server secret
+- HUME_BUDGET_VERIFIED=1: only after current portal usage is checked
+- HUME_BUDGET_CHARACTERS: verified REMAINING included characters minus a safety margin, not the plan's gross allowance
+- HUME_BUDGET_PERIOD_END: actual account billing period's expiry, Unix seconds
+- HUME_BUDGET_SCOPE: stable account/period-budget identifier; never change it to reset consumed reservations
+
+Near-limit warning at 10% remaining; exhaustion degrades by stopping paid speech, not silently switching to an unapproved paid voice. Reconcile the ledger against Hume portal usage, particularly before enabling a test or call. The key may be shared with other apps, so this service's ledger alone cannot prevent another client from consuming the same allowance. Ongoing shared-key calling requires a current account-wide usage feed or exclusive usage agreement. Hume-managed EVI external LLM billing is not used.
+
+First-party billing: https://dev.hume.ai/docs/resources/billing.md . Overage can accrue after included allowance and is charged in $44 increments; a payment-card limit is not a usage cap.
