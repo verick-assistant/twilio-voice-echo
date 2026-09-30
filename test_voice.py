@@ -70,6 +70,27 @@ class Tests(unittest.TestCase):
     def test_no_header_call_even_with_config(self):
         with patch.dict(os.environ, {'CALL_TOKEN':'unit-test-only'}):
             self.assertEqual(TestClient(app.app).post('/call').status_code,401)
+    def test_budget_missing_fails_closed(self):
+        async def check():
+            with patch.dict(os.environ, {'USAGE_REDIS_URL':'','HUME_BUDGET_VERIFIED':'0'}):
+                budget=app.TTSBudget()
+                self.assertFalse(budget.configured())
+                with self.assertRaises(app.BudgetUnavailable):
+                    await budget.reserve('Hello')
+        asyncio.run(check())
+    def test_reservation_before_audio_send(self):
+        class Budget:
+            limit=100
+            async def reserve(self,text): raise app.BudgetUnavailable('exhausted')
+        class TTS:
+            sent=False
+            async def send(self,value): self.sent=True
+        async def check():
+            session=app.Session(FakeSocket()); session.budget=Budget(); tts=TTS()
+            with self.assertRaises(app.BudgetUnavailable):
+                await session.send_tts(tts,{'text':'Hello'}, {})
+            self.assertFalse(tts.sent)
+        asyncio.run(check())
     def test_pcm_conversion(self):
         async def check():
             ws=FakeSocket(); session=app.Session(ws); ws.session=session; session.stream_sid='MZ-test'
