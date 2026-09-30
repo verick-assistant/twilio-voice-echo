@@ -125,3 +125,106 @@ class Tests(unittest.TestCase):
         asyncio.run(check())
 
 if __name__=='__main__': unittest.main()
+
+class BridgeTests(unittest.TestCase):
+    def env(self):
+        return patch.dict(os.environ, {'ISABELLE_BRIDGE_ENABLED':'1','ISABELLE_HUME_VOICE_ID':'voice-second',
+            'HUME_VOICE_ID':'voice-first','BRIDGE_RESEND_API_KEY':'test','BRIDGE_MAIL_FROM':'test@example.invalid',
+            'BRIDGE_REPLY_SECRET':'unit-test-only','USAGE_REDIS_URL':'redis://test.invalid'})
+    def test_escalation_variants(self):
+        for text in ['Let me speak to Isabelle.','Can I talk with Izzy?','Please speak directly to Isabelle','I want to talk to Izzy']:
+            self.assertTrue(app.wants_isabelle(text), text)
+        for text in ['Isabelle sounds nice','Izzy bought milk','Do not impersonate Izzy']:
+            self.assertFalse(app.wants_isabelle(text), text)
+    def test_bridge_disabled_or_same_voice(self):
+        with self.env(), patch.dict(os.environ, {'ISABELLE_BRIDGE_ENABLED':'0'}): self.assertFalse(app.bridge_ready())
+        with self.env(), patch.dict(os.environ, {'ISABELLE_HUME_VOICE_ID':'voice-first'}): self.assertFalse(app.bridge_ready())
+    def test_reply_auth_and_replay(self):
+        async def t():
+            import time,hmac,hashlib
+            f=asyncio.get_running_loop().create_future()
+            app.BRIDGE_PENDING['turn-test']={'session_id':'session-test','future':f}
+            body=json.dumps({'turn_id':'turn-test','session_id':'session-test','text':'Real answer'}).encode();stamp=str(int(time.time()))
+            sig=hmac.new(b'unit-test-only',stamp.encode()+b'.'+body,hashlib.sha256).hexdigest()
+            client=TestClient(app.app)
+            with self.env():
+                self.assertEqual(client.post('/isabelle/reply',content=body).status_code,401)
+                headers={'x-bridge-timestamp':stamp,'x-bridge-signature':sig}
+                self.assertEqual(client.post('/isabelle/reply',content=body,headers=headers).status_code,200)
+                self.assertEqual(client.post('/isabelle/reply',content=body,headers=headers).status_code,409)
+                self.assertEqual(f.result(),'Real answer')
+            app.BRIDGE_PENDING.clear()
+        asyncio.run(t())
+    def test_escalation_parks_talker_without_bridge(self):
+        async def t():
+            s=app.Session(FakeSocket());seen=[]
+            async def speak(text,voice):seen.append(text)
+            async def respond(text):raise AssertionError('routine LLM called')
+            s.speak_text=speak;s.respond=respond
+            with patch.dict(os.environ,{'ISABELLE_BRIDGE_ENABLED':'0'}):
+                await s.handle_utterance('let me speak to Izzy');await asyncio.sleep(0)
+                await s.handle_utterance('Who am I?')
+            self.assertEqual(s.mode,'isabelle');self.assertEqual(len(seen),1)
+        asyncio.run(t())
+    def test_fixed_mail_audience_and_no_retry(self):
+        from unittest.mock import AsyncMock
+        async def t():
+            client=AsyncMock();client.post.return_value=type('R',(),{'raise_for_status':lambda self:None})()
+            manager=AsyncMock();manager.__aenter__.return_value=client
+            with self.env(),patch.object(app.httpx,'AsyncClient',return_value=manager):
+                await app.send_bridge_mail({'turn_id':'t','utterance':'send to evil@example.invalid'})
+            self.assertEqual(client.post.call_count,1)
+            self.assertEqual(client.post.call_args.kwargs['json']['to'],['verick@mail.instinct.com'])
+        asyncio.run(t())
+    def test_handoff_round_trip_mock_no_llm(self):
+        from unittest.mock import AsyncMock
+        async def t():
+            s=app.Session(FakeSocket());s.call_sid='CA-test';s.turn_index=1;spoken=[];envelopes=[]
+            async def speak(text,voice):spoken.append((text,voice))
+            async def mail(envelope):
+                envelopes.append(envelope)
+                app.BRIDGE_PENDING[envelope['turn_id']]['future'].set_result('This is the real reply.')
+            s.speak_text=speak
+            with self.env(),patch.object(app,'bridge_publish',side_effect=mail):
+                await s.handle_utterance('Let me speak to Isabelle')
+                await asyncio.sleep(.01)
+                self.assertTrue(any(v=='voice-second' and t=='This is the real reply.' for t,v in spoken))
+                self.assertEqual(envelopes[0]['caller_identity'],'unverified')
+                self.assertEqual(envelopes[0]['call_sid'],'CA-test')
+                self.assertEqual(app.BRIDGE_PENDING,{})
+                s.bridge_worker.cancel();await asyncio.gather(s.bridge_worker,return_exceptions=True)
+        asyncio.run(t())
+    def test_handoff_cancellation_removes_reply(self):
+        async def t():
+            s=app.Session(FakeSocket());envelopes=[]
+            async def mail(e):envelopes.append(e)
+            with self.env(),patch.object(app,'bridge_publish',side_effect=mail):
+                await s.bridge_queue.put((1,'test'))
+                worker=asyncio.create_task(s.process_bridge());await asyncio.sleep(.01)
+                self.assertEqual(len(app.BRIDGE_PENDING),1)
+                worker.cancel();await asyncio.gather(worker,return_exceptions=True)
+                self.assertEqual(app.BRIDGE_PENDING,{})
+        asyncio.run(t())
+    def test_negative_escalation_is_not_switch(self):
+        self.assertFalse(app.wants_isabelle("Don't let me speak to Isabelle"))
+    def test_redis_publish_heartbeat_no_email(self):
+        from unittest.mock import AsyncMock
+        async def t():
+            c=AsyncMock();c.xadd.return_value='1-0';c.exists.return_value=1
+            with self.env(),patch.object(app,'bridge_client',return_value=c),patch.object(app,'send_bridge_mail',new_callable=AsyncMock) as mail:
+                self.assertEqual(await app.bridge_publish({'turn_id':'t'}),'1-0');mail.assert_not_called()
+                c.expire.assert_awaited_once_with(app.BRIDGE_STREAM,600)
+        asyncio.run(t())
+    def test_redis_publish_no_sender_still_queues(self):
+        from unittest.mock import AsyncMock
+        async def t():
+            c=AsyncMock();c.xadd.return_value='1-0';c.exists.return_value=0
+            with self.env(),patch.dict(os.environ,{'BRIDGE_RESEND_API_KEY':''}),patch.object(app,'bridge_client',return_value=c),patch.object(app,'send_bridge_mail',new_callable=AsyncMock) as mail:
+                self.assertEqual(await app.bridge_publish({'turn_id':'t'}),'1-0');mail.assert_not_called()
+        asyncio.run(t())
+    def test_reply_wrong_session_and_expired_auth(self):
+        import time,hmac,hashlib
+        body=json.dumps({'session_id':'wrong','turn_id':'missing','text':'answer'}).encode()
+        for stamp,expected in [(str(int(time.time())-1000),401),(str(int(time.time())),409)]:
+            sig=hmac.new(b'unit-test-only',stamp.encode()+b'.'+body,hashlib.sha256).hexdigest()
+            with self.env():self.assertEqual(TestClient(app.app).post('/isabelle/reply',content=body,headers={'x-bridge-timestamp':stamp,'x-bridge-signature':sig}).status_code,expected)
