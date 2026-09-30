@@ -1,6 +1,6 @@
 # Realtime voice service v2
 
-FastAPI/ASGI service for Twilio bidirectional Media Streams. Streaming Deepgram Nova-3 recognition feeds Jev typed model routing, OpenRouter streaming responses, and Hume Octave streaming synthesis. Hume 48kHz signed 16-bit mono PCM is statefully converted to 8kHz mu-law for Twilio. All providers must be configured before calls are enabled.
+FastAPI/ASGI service for Twilio bidirectional Media Streams. Streaming Deepgram Nova-3 recognition feeds Jev typed model routing, OpenRouter streaming responses, and Hume Octave streaming synthesis. Hume 48kHz signed 16-bit mono PCM is statefully converted to 8kHz mu-law for Twilio. The STT, LLM, and TTS providers must be configured before calls are enabled; missing Jev access uses an explicit degraded capable-model route.
 
 ## Deployment
 
@@ -15,6 +15,8 @@ Required environment:
 - DEEPGRAM_API_KEY, OPENROUTER_API_KEY, HUME_API_KEY
 - TYPESAFE_API_KEY enables Jev; missing key uses an explicitly logged capable-model fallback
 - HUME_VOICE_ID or HUME_VOICE_NAME (verify the selected British female voice)
+
+Execution is disabled by default. REALTIME_ENABLED=1 enables calls. DIAGNOSTICS_ENABLED=1 plus DIAGNOSTIC_TOKEN enables the private fixture WebSocket for short no-dial tests. Never enable either merely because keys are present.
 
 Optional: STREAM_SECRET, MODEL_FAST, MODEL_CAPABLE, HUME_SAMPLE_RATE (48000), ENDPOINTING_MS (100).
 
@@ -32,7 +34,7 @@ Twilio voice webhook: POST `/voice`. WebSocket `/media-stream` validates Twilio 
 - The voice service has no access to private accounts, persistent memory, or action tools. Do not mistake a conversational model response for an action taken by an assistant.
 - Render free instances can spin down for 50+ seconds. Warm tests are not cold-call guarantees.
 
-Run local tests: `python -m unittest -v test_voice.py`. Mock tests cover signatures, TwiML, transcript assembly, audio conversion, and cancellation. Live provider and PSTN tests are separate and must not be represented as passing based on mocks.
+Run local tests: `python -m unittest -v test_voice.py`. Mock tests cover signatures, TwiML, transcript assembly, audio conversion, cancellation, the default-disabled execution gate, and missing Jev key routing. Live provider and PSTN tests are separate and must not be represented as passing based on mocks.
 
 ## Sources
 
