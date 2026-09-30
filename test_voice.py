@@ -544,3 +544,32 @@ class SpeechGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(app.wants_isabelle('Let me speak to Izzy'))
         self.assertIn('You are Izzy, the fast front voice assistant', app.SYSTEM)
         self.assertEqual(app.CACHED_TEXT['waiting'], "I'm still working on that, give me just a moment.")
+
+class RedisPoolTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncTearDown(self):
+        await app.close_redis_pools()
+
+    async def test_reuses_bounded_pool_without_client_ownership(self):
+        a = app.shared_redis_client('rediss://localhost:6379', True, 25)
+        b = app.shared_redis_client('rediss://localhost:6379', True, 25)
+        self.assertIs(a.connection_pool, b.connection_pool)
+        self.assertEqual(a.connection_pool.max_connections, 8)
+        self.assertFalse(a.auto_close_connection_pool)
+        await a.aclose()
+        self.assertIs(b.connection_pool, app.REDIS_POOLS[('rediss://localhost:6379', True, 25)])
+        await b.aclose()
+
+    async def test_health_does_not_allocate_redis_client(self):
+        with patch.dict(os.environ, {'USAGE_REDIS_URL':'redis://localhost:6379',
+            'HUME_BUDGET_CHARACTERS':'100', 'HUME_BUDGET_PERIOD_END':'9999999999',
+            'HUME_BUDGET_VERIFIED':'1', 'HUME_BUDGET_SCOPE':'test'}), patch.object(app, 'shared_redis_client') as factory:
+            result = await app.health()
+            self.assertTrue(result['tts_budget_configured'])
+            self.assertGreater(result['memory_rss_kb'], 0)
+            factory.assert_not_called()
+
+    async def test_shutdown_clears_pool_registry(self):
+        app.shared_redis_client('redis://localhost:6379')
+        self.assertTrue(app.REDIS_POOLS)
+        await app.close_redis_pools()
+        self.assertFalse(app.REDIS_POOLS)
