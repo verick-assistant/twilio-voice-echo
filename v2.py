@@ -56,7 +56,7 @@ def ready():
 
 @app.get('/health')
 async def health():
-    return {'ok': True, 'version': VERSION, 'realtime_ready': ready(),
+    return {'ok': True, 'version': VERSION, 'realtime_ready': ready(), 'realtime_enabled': os.getenv('REALTIME_ENABLED') == '1',
             'providers': {k.removesuffix('_API_KEY').lower(): bool(os.getenv(k)) for k in KEYS},
             'voice_configured': bool(os.getenv('HUME_VOICE_ID') or os.getenv('HUME_VOICE_NAME')),
             'twilio_env': bool(os.getenv('TWILIO_ACCOUNT_SID') and os.getenv('TWILIO_AUTH_TOKEN'))}
@@ -67,7 +67,7 @@ async def voice(request: Request):
     params = dict(await request.form()) if request.method == 'POST' else dict(request.query_params)
     if not BASE or not signature_valid(BASE + '/voice', params, request.headers.get('x-twilio-signature', '')):
         return Response(status_code=403)
-    if not ready():
+    if not ready() or os.getenv('REALTIME_ENABLED') != '1':
         return Response('<?xml version="1.0"?><Response><Say>The realtime voice service is not ready yet. Please try again later.</Say><Hangup/></Response>', media_type='text/xml')
     sid = params.get('CallSid', '')
     expiry = str(int(time.time()) + 90)
@@ -86,7 +86,7 @@ async def call(request: Request):
     expected = os.getenv('CALL_TOKEN', '')
     if not expected or not hmac.compare_digest(supplied, expected):
         return JSONResponse({'ok': False, 'error': 'unauthorized'}, status_code=401)
-    if not ready():
+    if not ready() or os.getenv('REALTIME_ENABLED') != '1':
         return JSONResponse({'ok': False, 'error': 'realtime providers not ready'}, status_code=503)
     sid, token = os.getenv('TWILIO_ACCOUNT_SID', ''), os.getenv('TWILIO_AUTH_TOKEN', '')
     source, dest = os.getenv('TWILIO_FROM_NUMBER', ''), os.getenv('TEST_TO_NUMBER', '')
@@ -405,7 +405,7 @@ class Session:
 async def media_stream(ws: WebSocket):
     # Authenticate both the Twilio handshake and a short-lived per-call signed token.
     url = BASE + '/media-stream'
-    if not BASE or not ready() or not signature_valid(url, {}, ws.headers.get('x-twilio-signature', '')):
+    if not BASE or not ready() or os.getenv('REALTIME_ENABLED') != '1' or not signature_valid(url, {}, ws.headers.get('x-twilio-signature', '')):
         await ws.close(code=1008)
         return
     await ws.accept()
