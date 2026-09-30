@@ -74,7 +74,7 @@ class TTSBudget:
 
 log = logging.getLogger('voice')
 app = FastAPI()
-VERSION = '2.3.1'
+VERSION = '2.3.2'
 BASE = os.getenv('BASE_URL', '').rstrip('/')
 KEYS = ('DEEPGRAM_API_KEY', 'OPENROUTER_API_KEY', 'HUME_API_KEY')
 # Model IDs are configurable and must be validated against OpenRouter before live use.
@@ -817,8 +817,11 @@ class Session:
 @app.websocket('/media-stream')
 async def media_stream(ws: WebSocket):
     # Authenticate both the Twilio handshake and a short-lived per-call signed token.
-    url = BASE + '/media-stream'
-    if not BASE or not ready() or os.getenv('REALTIME_ENABLED') != '1' or not signature_valid(url, {}, ws.headers.get('x-twilio-signature', '')):
+    url = BASE.replace('https://', 'wss://').replace('http://', 'ws://') + '/media-stream'
+    supplied = ws.headers.get('x-twilio-signature', '')
+    # Match the configured Stream URL; Twilio documents a trailing-slash handshake variant.
+    valid = signature_valid(url, {}, supplied) or signature_valid(url + '/', {}, supplied)
+    if not BASE or not ready() or os.getenv('REALTIME_ENABLED') != '1' or not valid:
         await ws.close(code=1008)
         return
     await ws.accept()
