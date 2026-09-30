@@ -1,4 +1,4 @@
-"""Realtime telephony adapter. No recordings, transcripts, or credentials in logs."""
+"""Realtime telephony adapter. Encrypted private review capture; no transcripts or credentials in server logs."""
 import asyncio
 import audioop
 import base64
@@ -12,6 +12,7 @@ import os
 import secrets
 import time
 import re
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.exceptions import InvalidSignature
 from collections import deque
@@ -74,7 +75,7 @@ class TTSBudget:
 
 log = logging.getLogger('voice')
 app = FastAPI()
-VERSION = '2.4.0'
+VERSION = '2.5.0'
 BASE = os.getenv('BASE_URL', '').rstrip('/')
 KEYS = ('DEEPGRAM_API_KEY', 'OPENROUTER_API_KEY', 'HUME_API_KEY')
 # Model IDs are configurable and must be validated against OpenRouter before live use.
@@ -323,10 +324,14 @@ async def voice(request: Request):
         return Response(status_code=403)
     if not ready() or os.getenv('REALTIME_ENABLED') != '1':
         return Response('<?xml version="1.0"?><Response><Say>The realtime voice service is not ready yet. Please try again later.</Say><Hangup/></Response>', media_type='text/xml')
+    allowed = os.getenv('TEST_FROM_NUMBER', '+17865271894')
+    if not allowed or params.get('From') != allowed:
+        return Response('<Response><Say>This line is currently limited to an authorized test caller.</Say><Hangup/></Response>', media_type='text/xml')
     sid = params.get('CallSid', '')
     expiry = str(int(time.time()) + 90)
     url = BASE.replace('https://', 'wss://').replace('http://', 'ws://') + '/media-stream'
-    body = (f'<Response><Connect><Stream url="{html.escape(url, quote=True)}">'
+    notice = '<Say>This call is being recorded for review.</Say>' if os.getenv('RECORDING_NOTICE_ENABLED', '1') == '1' else ''
+    body = (f'<Response>{notice}<Connect><Stream url="{html.escape(url, quote=True)}">'
             f'<Parameter name="expires" value="{expiry}"/>'
             f'<Parameter name="token" value="{stream_token(sid, expiry)}"/>'
             '</Stream></Connect><Hangup/></Response>')
@@ -354,9 +359,188 @@ async def call(request: Request):
         return {'ok': True, 'call_sid': r.json().get('sid')}
 
 
+class CallCapture:
+    """Encrypted, timestamped transport capture. Submitted output is not heard audio."""
+    def __init__(self, sid, session):
+        self.sid = sid
+        self.session = session
+        self.retention = max(3600, min(30*86400, int(os.getenv('RECORDING_RETENTION_SECONDS', '604800'))))
+        self.expiry = int(time.time()) + self.retention
+        self.key = 'voice:recording:v1:' + session
+        secret = os.getenv('RECORDING_ENCRYPTION_KEY') or os.getenv('STREAM_SECRET') or os.getenv('TWILIO_AUTH_TOKEN', '')
+        if not secret or not os.getenv('USAGE_REDIS_URL'):
+            raise RuntimeError('recording_storage_unconfigured')
+        self.cipher = AESGCM(hashlib.sha256(('voice-recording-v1:'+secret).encode()).digest())
+        self.client = redis.from_url(os.environ['USAGE_REDIS_URL'], socket_timeout=5, socket_connect_timeout=3)
+        self.started = now()
+        self.pending = []
+        self.failed = False
+
+    def add(self, kind, **fields):
+        if self.failed:
+            raise RuntimeError('recording_storage_failed')
+        self.pending.append(dict(kind=kind, ms=round((now()-self.started)*1000), **fields))
+        if len(self.pending) > 1000:
+            self.failed = True
+            raise RuntimeError('recording_backlog_limit')
+
+    async def flush(self):
+        if not self.pending:
+            return
+        batch, self.pending = self.pending, []
+        nonce = os.urandom(12)
+        sealed = nonce + self.cipher.encrypt(nonce, json.dumps(batch, ensure_ascii=False).encode(), self.key.encode())
+        try:
+            pipe = self.client.pipeline(transaction=True)
+            pipe.rpush(self.key, sealed)
+            pipe.expireat(self.key, self.expiry)
+            await pipe.execute()
+        except Exception:
+            self.failed = True
+            raise RuntimeError('recording_storage_failed') from None
+
+    async def writer(self):
+        while True:
+            await asyncio.sleep(1)
+            await self.flush()
+
+    async def start(self):
+        self.add('start', call_sid=self.sid, session=self.session, retention_seconds=self.retention,
+                 inbound_format='mulaw_8000_mono', outbound_format='mulaw_8000_mono',
+                 caveat='Outbound is submitted audio, not verified heard audio. clear and mark events retained.')
+        await self.flush()
+        await self.client.zadd('voice:recordings:v1:index', {self.session: self.expiry})
+        await self.client.zremrangebyscore('voice:recordings:v1:index', '-inf', int(time.time()))
+
+    async def finish(self):
+        try:
+            self.add('stop')
+            await self.flush()
+        finally:
+            await self.client.aclose()
+
+
+def recording_authorized(request):
+    token = os.getenv('DIAGNOSTIC_TOKEN', '')
+    return bool(token and hmac.compare_digest(request.headers.get('x-recording-token', ''), token))
+
+@app.get('/recordings')
+async def recording_index(request: Request):
+    if not recording_authorized(request):
+        return Response(status_code=401)
+    client = bridge_client()
+    try:
+        ids = await client.zrangebyscore('voice:recordings:v1:index', int(time.time())+1, '+inf')
+        return JSONResponse({'sessions': ids, 'retention_seconds': int(os.getenv('RECORDING_RETENTION_SECONDS', '604800'))})
+    finally:
+        await client.aclose()
+
+@app.get('/recordings/{session}')
+async def recording_review(session: str, request: Request):
+    if not recording_authorized(request):
+        return Response(status_code=401)
+    if not re.fullmatch(r'(?:[a-zA-Z0-9_-]{24}|provider-RE[0-9a-fA-F]{32})', session):
+        return Response(status_code=422)
+    capture = CallCapture('', session)
+    try:
+        chunks = await capture.client.lrange(capture.key, 0, -1)
+        if not chunks:
+            return Response(status_code=404)
+        events = []
+        for chunk in chunks:
+            events.extend(json.loads(capture.cipher.decrypt(chunk[:12], chunk[12:], capture.key.encode())))
+        return JSONResponse({'session': session, 'events': events}, headers={'Cache-Control':'no-store'})
+    except Exception:
+        return Response(status_code=503)
+    finally:
+        await capture.client.aclose()
+
+
+async def start_provider_recording(client, sid):
+    if os.getenv('TWILIO_RECORDING_ENABLED') != '1':
+        return None
+    if not re.fullmatch(r'CA[0-9a-fA-F]{32}', sid):
+        raise RuntimeError('recording_call_sid_invalid')
+    account = os.environ['TWILIO_ACCOUNT_SID']
+    r = await client.post(f'https://api.twilio.com/2010-04-01/Accounts/{account}/Calls/{sid}/Recordings.json',
+        auth=(account, os.environ['TWILIO_AUTH_TOKEN']),
+        data={'RecordingChannels':'dual', 'RecordingTrack':'both', 'Trim':'do-not-trim',
+              'RecordingStatusCallback':BASE+'/recording-status', 'RecordingStatusCallbackEvent':'completed absent'}, timeout=8)
+    r.raise_for_status()
+    result = r.json()
+    if not re.fullmatch(r'RE[0-9a-fA-F]{32}', result.get('sid','')):
+        raise RuntimeError('recording_provider_invalid')
+    ledger = bridge_client()
+    try:
+        expires = int(time.time()) + max(3600, min(30*86400, int(os.getenv('RECORDING_RETENTION_SECONDS', '604800'))))
+        await ledger.zadd('voice:provider-recordings:v1:expiry', {result['sid']:expires})
+    finally:
+        await ledger.aclose()
+    return result
+
+async def purge_provider_recordings():
+    if not os.getenv('USAGE_REDIS_URL'):
+        return
+    ledger = bridge_client()
+    try:
+        expired = await ledger.zrangebyscore('voice:provider-recordings:v1:expiry', '-inf', int(time.time()), start=0, num=100)
+        async with httpx.AsyncClient() as client:
+            for recording in expired:
+                if not re.fullmatch(r'RE[0-9a-fA-F]{32}', recording):
+                    continue
+                account = os.environ['TWILIO_ACCOUNT_SID']
+                r = await client.delete(f'https://api.twilio.com/2010-04-01/Accounts/{account}/Recordings/{recording}.json',
+                    auth=(account,os.environ['TWILIO_AUTH_TOKEN']), timeout=8)
+                if r.status_code in (204,404):
+                    await ledger.zrem('voice:provider-recordings:v1:expiry', recording)
+                else:
+                    log.error('voice_recording_retention_delete_failed status=%d', r.status_code)
+    finally:
+        await ledger.aclose()
+
+async def recording_retention_worker():
+    while True:
+        try:
+            await purge_provider_recordings()
+        except Exception:
+            log.error('voice_recording_retention_check_failed')
+        await asyncio.sleep(3600)
+
+@app.on_event('startup')
+async def start_retention_worker():
+    app.state.retention_worker = asyncio.create_task(recording_retention_worker())
+
+@app.on_event('shutdown')
+async def stop_retention_worker():
+    task = getattr(app.state,'retention_worker',None)
+    if task:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+@app.post('/recording-status')
+async def recording_status(request: Request):
+    params = dict(await request.form())
+    if not signature_valid(BASE+'/recording-status', params, request.headers.get('x-twilio-signature','')):
+        return Response(status_code=403)
+    call_sid = params.get('CallSid','')
+    if not re.fullmatch(r'CA[0-9a-fA-F]{32}', call_sid):
+        return Response(status_code=422)
+    capture = CallCapture(call_sid, 'provider-'+params.get('RecordingSid',''))
+    try:
+        await capture.start()
+        capture.add('provider_status', data=params)
+        await capture.finish()
+    except Exception:
+        return Response(status_code=503)
+    return Response(status_code=204)
+
+
 class Session:
     def __init__(self, ws):
         self.ws = ws
+        self.capture = None
+        self.capture_writer = None
         self.budget = TTSBudget()
         self.stream_sid = ''
         self.call_sid = ''
@@ -399,6 +583,8 @@ class Session:
 
     async def send(self, data):
         await self.ws.send_json(data)
+        if self.capture and data.get("event") in ("media", "mark", "clear"):
+            self.capture.add("outbound_"+data["event"], turn=self.turn_index, data=data)
 
     async def clear(self):
         log.warning("voice_playback_cancel session=%s turn=%d playing=%s pending_marks=%d", self.session_id, self.turn_index, self.playing, len(self.pending_marks))
@@ -459,8 +645,6 @@ class Session:
             msg = json.loads(raw)
             if msg.get('type') == 'SpeechStarted':
                 self.speech_started = now()
-                if self.coalesce_task and not self.coalesce_task.done():
-                    self.coalesce_task.cancel()
                 continue
             if msg.get('type') == 'Error':
                 raise RuntimeError('stt_provider_error')
@@ -481,6 +665,8 @@ class Session:
                     self.route_text = text
                     self.route_task = self.spawn(self.route(text))
             if msg.get('is_final') and text:
+                if self.capture:
+                    self.capture.add("stt_final", turn=self.turn_index+1, transcript=text, speech_final=bool(msg.get("speech_final")), provider_start=msg.get("start"), provider_duration=msg.get("duration"))
                 self.final_parts.append(text)
                 self.stt_final_count += 1
                 log.warning('voice_stt_fragment session=%s characters=%d speech_final=%s', self.session_id, len(text), bool(msg.get('speech_final')))
@@ -826,6 +1012,14 @@ class Session:
                     return
                 self.stream_sid = start['streamSid']
                 self.call_sid = sid
+                self.capture = CallCapture(sid, self.session_id)
+                await self.capture.start()
+                if not diagnostic:
+                    provider = await start_provider_recording(self.client, sid)
+                    if provider:
+                        self.capture.add('provider_recording', recording_sid=provider['sid'], status=provider.get('status'), channels=provider.get('channels'))
+                        await self.capture.flush()
+                self.capture_writer = self.spawn(self.capture.writer())
                 if not diagnostic:
                     limit = max(1, min(int(os.getenv('CALL_MAX_SECONDS', '1200')), 1200))
                     self.spawn(self.enforce_session_limit(limit))
@@ -841,8 +1035,8 @@ class Session:
                     uploader = self.spawn(self.upload_audio())
                     while True:
                         receive = asyncio.create_task(self.ws.receive_json())
-                        done, _ = await asyncio.wait({receive, reader, uploader}, return_when=asyncio.FIRST_COMPLETED)
-                        if reader in done or uploader in done:
+                        done, _ = await asyncio.wait({receive, reader, uploader, self.capture_writer}, return_when=asyncio.FIRST_COMPLETED)
+                        if reader in done or uploader in done or self.capture_writer in done:
                             receive.cancel()
                             with contextlib.suppress(asyncio.CancelledError):
                                 await receive
@@ -854,10 +1048,12 @@ class Session:
                             payload = base64.b64decode(msg['media']['payload'], validate=True)
                             if len(payload) > 8000:
                                 raise ValueError('oversized_media')
+                            self.capture.add("inbound_media", timestamp=msg.get("media", {}).get("timestamp"), payload=msg["media"]["payload"])
                             self.inbound_frames += 1
                             self.inbound_bytes += len(payload)
                             self.audio_queue.put_nowait(payload)
                         elif msg.get('event') == 'mark':
+                            self.capture.add('mark_ack', data=msg.get('mark'))
                             mark_name = msg.get('mark', {}).get('name')
                             self.pending_marks.discard(mark_name)
                             sent = self.mark_sent.pop(mark_name, None)
@@ -876,6 +1072,11 @@ class Session:
                 for task in list(self.tasks):
                     task.cancel()
                 await asyncio.gather(*list(self.tasks), return_exceptions=True)
+                if self.capture:
+                    try:
+                        await self.capture.finish()
+                    except Exception:
+                        log.error("voice_recording_incomplete session=%s call_sid=%s", self.session_id, self.call_sid)
                 self.history.clear()
                 self.bridge_context.clear()
                 self.caller_brief = ''
