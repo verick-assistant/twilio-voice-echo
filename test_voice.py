@@ -54,6 +54,20 @@ class Tests(unittest.TestCase):
             r=TestClient(app.app).post('/voice',data=params,headers={'x-twilio-signature':sig})
             self.assertNotIn('<Stream',r.text)
             self.assertIn('<Hangup',r.text)
+    def test_session_cutoff_and_post_stream_hangup(self):
+        from unittest.mock import AsyncMock
+        async def check():
+            socket = AsyncMock(); session = app.Session(socket)
+            with patch.object(app.asyncio, 'sleep', new_callable=AsyncMock) as sleep:
+                await session.enforce_session_limit(1200)
+                sleep.assert_awaited_once_with(1200)
+                socket.close.assert_awaited_once_with(code=1000)
+        asyncio.run(check())
+        with patch.object(app,'BASE','https://test.invalid'):
+            params={'CallSid':'CA-test'}
+            sig=RequestValidator('unit-test-only').compute_signature(app.BASE+'/voice',params)
+            result=TestClient(app.app).post('/voice',data=params,headers={'x-twilio-signature':sig})
+            self.assertIn('</Stream></Connect><Hangup/>',result.text)
     def test_router_without_key(self):
         async def check():
             with patch.dict(os.environ, {'OPENROUTER_API_KEY':''}):
